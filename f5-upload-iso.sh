@@ -1,62 +1,79 @@
 #!/usr/bin/env bash
-
-#######################################
-# METADATA
-#######################################
-SCRIPT_NAME="f5-upload-iso.sh"
-SCRIPT_VERSION="1.0.0-GOLD"
-SCRIPT_DATE="2026-01-13"
-
-#######################################
-# VERSION
-#######################################
-if [[ "${1:-}" == "-v" || "${1:-}" == "--version" ]]; then
-  echo "$SCRIPT_NAME version $SCRIPT_VERSION ($SCRIPT_DATE)"
-  exit 0
-fi
-
-#######################################
-# SAFETY
-#######################################
 set -euo pipefail
 
 #######################################
 # CONFIG
 #######################################
 BIGIP_FILE="devices.txt"
-CHUNK_SIZE=$((512 * 1024 * 1024))  # 512 MB
+REMOTE_DIR="/shared/images"
 
 #######################################
-# PRECHECKS
+# USAGE
 #######################################
-command -v curl >/dev/null || { echo "❌ curl manquant"; exit 1; }
-command -v jq   >/dev/null || { echo "❌ jq requis"; exit 1; }
-
-[[ $# -eq 1 ]] || {
-  echo "Usage: $0 <fichier.iso>"
+if [[ $# -ne 2 ]]; then
+  echo "Usage: $0 <BIGIP.iso> <HOTFIX.hf>"
   exit 1
-}
+fi
 
-ISO_PATH="/apps/data/os_repository/F5/TMOS_17.1.3/BIGIP-17.1.3-0.0.11.iso"
-[[ -f "$ISO_PATH" ]] || { echo "❌ ISO introuvable"; exit 1; }
+ISO_PATH="$1"
+HF_PATH="$2"
 
 ISO_NAME=$(basename "$ISO_PATH")
-ISO_SIZE=$(stat -c%s "$ISO_PATH")
+HF_NAME=$(basename "$HF_PATH")
+
+[[ -f "$ISO_PATH" ]] || { echo "❌ ISO introuvable"; exit 1; }
+[[ -f "$HF_PATH" ]]  || { echo "❌ Hotfix introuvable"; exit 1; }
 
 #######################################
 # INPUTS
 #######################################
-read -p "Utilisateur : " API_USER
-read -s -p "Mot de passe : " API_PASS
+read -p "Utilisateur SSH (root recommandé): " SSH_USER
+read -s -p "Mot de passe SSH: " SSH_PASS
 echo
 
 #######################################
-# MAIN LOOP
+# TOOLS
+#######################################
+for bin in sshpass curl jq; do
+  command -v "$bin" >/dev/null || {
+    echo "❌ $bin requis"
+    exit 1
+  }
+done
+
+#######################################
+# FUNCTIONS
+#######################################
+get_ha_state() {
+  curl -sSk \
+    -u "${SSH_USER}:${SSH_PASS}" \
+    "https://${1}/mgmt/tm/cm/failover-status" |
+  jq -r '.entries[].nestedStats.entries.status.description'
+}
+
+remote_file_exists() {
+  sshpass -p "$SSH_PASS" ssh \
+    -o StrictHostKeyChecking=no \
+    -o LogLevel=Error \
+    "$SSH_USER@$1" \
+    "test -f ${REMOTE_DIR}/$2"
+}
+
+scp_upload() {
+  sshpass -p "$SSH_PASS" scp \
+    -o StrictHostKeyChecking=no \
+    -o ConnectTimeout=20 \
+    "$2" \
+    "$SSH_USER@$1:${REMOTE_DIR}/$3"
+}
+
+#######################################
+# MAIN
 #######################################
 echo
-echo "📀 Upload ISO : $ISO_NAME"
-echo "📦 Taille     : $ISO_SIZE octets"
-echo "📦 Chunk size : $CHUNK_SIZE octets"
+echo "📦 Workflow ISO + Hotfix"
+echo "ISO    : $ISO_NAME"
+echo "Hotfix : $HF_NAME"
 echo
 
 while IFS= read -r F5_HOST; do
@@ -67,31 +84,37 @@ while IFS= read -r F5_HOST; do
   echo "➡️  BIG-IP : $F5_HOST"
   echo "======================================"
 
-  echo "⬆️  Début upload ISO"
+  HA_STATE=$(get_ha_state "$F5_HOST")
 
-  OFFSET=0
+  if [[ "$HA_STATE" != "ACTIVE" ]]; then
+    echo "⏭️  État HA : $HA_STATE → ignoré"
+    echo
+    continue
+  fi
 
-  while [[ $OFFSET -lt $ISO_SIZE ]]; do
-    END=$((OFFSET + CHUNK_SIZE - 1))
-    [[ $END -ge $ISO_SIZE ]] && END=$((ISO_SIZE - 1))
+  echo "✅ État HA : ACTIVE"
 
-    echo "   ➤ Chunk $OFFSET-$END"
+  # ISO
+  if remote_file_exists "$F5_HOST" "$ISO_NAME"; then
+    echo "✔ ISO déjà présent"
+  else
+    echo "⬆️  Upload ISO"
+    scp_upload "$F5_HOST" "$ISO_PATH" "$ISO_NAME"
+    echo "✔ ISO uploadé"
+  fi
 
-    curl -sSk \
-      -u "${API_USER}:${API_PASS}" \
-      -X POST \
-      -H "Content-Type: application/octet-stream" \
-      -H "Content-Range: ${OFFSET}-${END}/${ISO_SIZE}" \
-      --data-binary @"$ISO_PATH" \
-      "https://${F5_HOST}/mgmt/shared/file-transfer/uploads/${ISO_NAME}" \
-      >/dev/null
+  # HOTFIX
+  if remote_file_exists "$F5_HOST" "$HF_NAME"; then
+    echo "✔ Hotfix déjà présent"
+  else
+    echo "⬆️  Upload Hotfix"
+    scp_upload "$F5_HOST" "$HF_PATH" "$HF_NAME"
+    echo "✔ Hotfix uploadé"
+  fi
 
-    OFFSET=$((END + 1))
-  done
-
-  echo "✅ Upload ISO terminé pour $F5_HOST"
+  echo "🎯 Uploads terminés pour $F5_HOST"
   echo
 
 done < "$BIGIP_FILE"
 
-echo "🎯 Upload ISO terminé sur tous les BIG-IP actifs"
+echo "🏁 Workflow ISO + Hotfix terminé"
