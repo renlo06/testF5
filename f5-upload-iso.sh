@@ -15,8 +15,8 @@ if [[ $# -ne 2 ]]; then
   exit 1
 fi
 
-ISO_PATH="$1"
-HF_PATH="$2"
+ISO_PATH="/apps/data/os_repository/F5/TMOS_17.1.3/BIGIP-17.1.3-0.0.11.iso"
+HF_PATH="/apps/data/os_repository/F5/TMOS_17.1.3/Hotfix-BIGIP-17.1.3.0.176.11-ENG.iso"
 
 ISO_NAME=$(basename "$ISO_PATH")
 HF_NAME=$(basename "$HF_PATH")
@@ -44,12 +44,6 @@ done
 #######################################
 # FUNCTIONS
 #######################################
-get_ha_state() {
-  curl -sSk \
-    -u "${SSH_USER}:${SSH_PASS}" \
-    "https://${1}/mgmt/tm/cm/failover-status" |
-  jq -r '.entries[].nestedStats.entries.status.description'
-}
 
 remote_file_exists() {
   sshpass -p "$SSH_PASS" ssh \
@@ -83,17 +77,7 @@ while IFS= read -r F5_HOST; do
   echo "======================================"
   echo "➡️  BIG-IP : $F5_HOST"
   echo "======================================"
-
-  HA_STATE=$(get_ha_state "$F5_HOST")
-
-  if [[ "$HA_STATE" != "ACTIVE" ]]; then
-    echo "⏭️  État HA : $HA_STATE → ignoré"
-    echo
-    continue
-  fi
-
-  echo "✅ État HA : ACTIVE"
-
+  
   # ISO
   if remote_file_exists "$F5_HOST" "$ISO_NAME"; then
     echo "✔ ISO déjà présent"
