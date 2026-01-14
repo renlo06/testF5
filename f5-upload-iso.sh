@@ -37,7 +37,7 @@ command -v jq   >/dev/null || { echo "❌ jq requis"; exit 1; }
   exit 1
 }
 
-ISO_PATH="$1"
+ISO_PATH="/apps/data/os_repository/F5/TMOS_17.1.3/BIGIP-17.1.3-0.0.11.iso"
 [[ -f "$ISO_PATH" ]] || { echo "❌ ISO introuvable"; exit 1; }
 
 ISO_NAME=$(basename "$ISO_PATH")
@@ -46,19 +46,9 @@ ISO_SIZE=$(stat -c%s "$ISO_PATH")
 #######################################
 # INPUTS
 #######################################
-read -p "Utilisateur API: " API_USER
-read -s -p "Mot de passe API: " API_PASS
+read -p "Utilisateur : " API_USER
+read -s -p "Mot de passe : " API_PASS
 echo
-
-#######################################
-# FUNCTIONS
-#######################################
-get_ha_state() {
-  curl -sSk \
-    -u "${API_USER}:${API_PASS}" \
-    "https://${1}/mgmt/tm/cm/failover-status" |
-  jq -r '.entries[].nestedStats.entries.status.description'
-}
 
 #######################################
 # MAIN LOOP
@@ -77,14 +67,6 @@ while IFS= read -r F5_HOST; do
   echo "➡️  BIG-IP : $F5_HOST"
   echo "======================================"
 
-  HA_STATE=$(get_ha_state "$F5_HOST")
-  if [[ "$HA_STATE" != "ACTIVE" ]]; then
-    echo "⏭️  État HA : $HA_STATE → ignoré"
-    echo
-    continue
-  fi
-
-  echo "✅ État HA : ACTIVE"
   echo "⬆️  Début upload ISO"
 
   OFFSET=0
