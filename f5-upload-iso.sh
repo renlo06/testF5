@@ -44,8 +44,8 @@ done
 # Vérifie si un fichier existe sur le BIG-IP
 # IMPORTANT : neutralise set -e
 remote_file_exists() {
-  sshpass -p "$SSH_PASS" ssh \
-    -o StrictHostKeyChecking=no \
+  sshpass -p "$SSH_PASS" ssh -n \
+    -o StrictHostKeyChecking=no -q \
     -o ConnectTimeout=15 \
     -o LogLevel=Error \
     "$SSH_USER@$1" \
