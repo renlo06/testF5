@@ -75,7 +75,12 @@ echo
 
 while IFS= read -r F5_HOST; do
   [[ -z "$F5_HOST" || "$F5_HOST" =~ ^# ]] && continue
-  F5_HOST=${F5_HOST//$'\r'/}
+  
+  # Supprime CR (Windows) et trim
+  HOST=$(echo "$LINE" | tr -d '\r' | xargs)
+
+  # Ignore ligne vide ou commentaire
+  [[ -z "$HOST" || "$HOST" =~ ^# ]] && continue
 
   COUNT=$((COUNT+1))
 
