@@ -1,4 +1,13 @@
 #!/usr/bin/env bash
+
+#######################################
+# SCRIPT METADATA
+#######################################
+SCRIPT_NAME="f5-upload-iso.sh"
+SCRIPT_VERSION="1.0"
+SCRIPT_DATE="2026-01-14"
+SCRIPT_AUTHOR="ggggg"
+
 set -euo pipefail
 
 #######################################
