@@ -12,7 +12,7 @@ ISO_PATH="/apps/data/os_repository/F5/TMOS_17.1.3/BIGIP-17.1.3-0.0.11.iso"
 HF_PATH="/apps/data/os_repository/F5/TMOS_17.1.3/Hotfix-BIGIP-17.1.3.0.176.11-ENG.iso"
 
 #######################################
-# VALIDATION CONFIG
+# VALIDATION DES FICHIERS
 #######################################
 ISO_NAME=$(basename "$ISO_PATH")
 HF_NAME=$(basename "$HF_PATH")
@@ -30,7 +30,7 @@ echo
 #######################################
 # TOOLS CHECK
 #######################################
-for bin in sshpass curl jq; do
+for bin in sshpass; do
   command -v "$bin" >/dev/null || {
     echo "❌ $bin requis"
     exit 1
@@ -40,7 +40,6 @@ done
 #######################################
 # FUNCTIONS
 #######################################
-
 remote_file_exists() {
   sshpass -p "$SSH_PASS" ssh \
     -o StrictHostKeyChecking=no \
@@ -64,48 +63,45 @@ scp_upload() {
 TOTAL=$(grep -Ev '^\s*#|^\s*$' "$BIGIP_FILE" | wc -l)
 COUNT=0
 SUCCESS=0
-SKIPPED=0
 
 echo
-echo "📦 Upload ISO + Hotfix (variables internes)"
-echo " ISO    : $ISO_NAME"
-echo " Hotfix : $HF_NAME"
-echo " Cibles : $TOTAL BIG-IP"
+echo "📦 Upload ISO + Hotfix (sans gestion HA)"
+echo "ISO    : $ISO_NAME"
+echo "Hotfix : $HF_NAME"
+echo "Cibles : $TOTAL BIG-IP"
 echo
 
-while IFS= read -r F5_HOST; do
-  [[ -z "$F5_HOST" || "$F5_HOST" =~ ^# ]] && continue
-  
-  # Supprime CR (Windows) et trim
+# Lecture robuste du fichier
+while IFS= read -r LINE || [[ -n "$LINE" ]]; do
   HOST=$(echo "$LINE" | tr -d '\r' | xargs)
 
-  # Ignore ligne vide ou commentaire
   [[ -z "$HOST" || "$HOST" =~ ^# ]] && continue
 
   COUNT=$((COUNT+1))
-
   echo "======================================"
-  echo "➡️  [$COUNT/$TOTAL] BIG-IP : $F5_HOST"
+  echo "➡️  [$COUNT/$TOTAL] BIG-IP : $HOST"
   echo "======================================"
 
-  if remote_file_exists "$F5_HOST" "$ISO_NAME"; then
+  # ISO
+  if remote_file_exists "$HOST" "$ISO_NAME"; then
     echo "✔ ISO déjà présent"
   else
     echo "⬆️  Upload ISO"
-    scp_upload "$F5_HOST" "$ISO_PATH" "$ISO_NAME"
+    scp_upload "$HOST" "$ISO_PATH" "$ISO_NAME"
     echo "✔ ISO uploadé"
   fi
 
-  if remote_file_exists "$F5_HOST" "$HF_NAME"; then
+  # HOTFIX
+  if remote_file_exists "$HOST" "$HF_NAME"; then
     echo "✔ Hotfix déjà présent"
   else
     echo "⬆️  Upload Hotfix"
-    scp_upload "$F5_HOST" "$HF_PATH" "$HF_NAME"
+    scp_upload "$HOST" "$HF_PATH" "$HF_NAME"
     echo "✔ Hotfix uploadé"
   fi
 
   SUCCESS=$((SUCCESS+1))
-  echo "🎯 $F5_HOST terminé"
+  echo "🎯 $HOST terminé"
   echo
 
 done < "$BIGIP_FILE"
@@ -114,8 +110,7 @@ done < "$BIGIP_FILE"
 # SUMMARY
 #######################################
 echo "======================================"
-echo "🏁 Résumé"
-echo " Cibles totales : $TOTAL"
-echo " Traitées       : $SUCCESS"
-echo " Ignorées (HA)  : $SKIPPED"
+echo "🏁 Résumé final"
+echo "Cibles totales : $TOTAL"
+echo "Traitées       : $SUCCESS"
 echo "======================================"
