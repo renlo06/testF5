@@ -2,144 +2,182 @@
 set -euo pipefail
 
 #######################################
-# CONFIGURATION
+# CONFIG
 #######################################
 DEVICES_FILE="devices.txt"
-AS3_RPM_PATH="/XXXXXX/f5-appsvcs-3.45.0-5.noarch.rpm"
+
+# AS3 RPM
+AS3_RPM_PATH="/XXXXX/f5-appsvcs-3.49.0-1.noarch.rpm"
+RPM_NAME=$(basename "$AS3_RPM_PATH")
+
+# Upload tuning
 RANGE_SIZE=5000000
-CONTENT_TYPE_JSON="Content-Type: application/json"
+
+# Curl options
+CURL_BASE_OPTS="--silent --insecure"
 
 #######################################
-# PRÉREQUIS
+# PRECHECKS
 #######################################
-for bin in curl jq wc awk seq; do
+for bin in curl jq; do
   command -v "$bin" >/dev/null || {
-    echo "❌ Binaire requis manquant : $bin"
+    echo "❌ $bin requis"
     exit 1
   }
 done
 
-[[ -f "$DEVICES_FILE" ]] || { echo "❌ Fichier équipements introuvable : $DEVICES_FILE"; exit 1; }
-[[ -f "$AS3_RPM_PATH" ]] || { echo "❌ RPM AS3 introuvable : $AS3_RPM_PATH"; exit 1; }
+[[ -f "$DEVICES_FILE" ]] || {
+  echo "❌ Fichier équipements introuvable : $DEVICES_FILE"
+  exit 1
+}
 
-RPM_NAME=$(basename "$AS3_RPM_PATH")
-RPM_SIZE=$(wc -c "$AS3_RPM_PATH" | awk '{print $1}')
+[[ -f "$AS3_RPM_PATH" ]] || {
+  echo "❌ RPM AS3 introuvable : $AS3_RPM_PATH"
+  exit 1
+}
 
 #######################################
-# AUTHENTIFICATION
+# INPUTS
 #######################################
-read -p "Utilisateur BIG-IP (admin recommandé): " API_USER
-read -s -p "Mot de passe BIG-IP: " API_PASS
+read -p "Utilisateur API (ex: admin): " API_USER
+read -s -p "Mot de passe API: " API_PASS
 echo
 
-CURL_AUTH="-u ${API_USER}:${API_PASS} --insecure --silent"
+CREDS="${API_USER}:${API_PASS}"
 
 #######################################
 # FUNCTIONS
 #######################################
 poll_task() {
-  local host="$1"
-  local task_id="$2"
-  local status="STARTED"
+  local TARGET="$1"
+  local TASK_ID="$2"
+  local STATUS="STARTED"
 
-  while [[ "$status" != "FINISHED" ]]; do
+  while [[ "$STATUS" != "FINISHED" ]]; do
     sleep 1
-    RESULT=$(curl $CURL_AUTH \
-      "https://${host}/mgmt/shared/iapp/package-management-tasks/${task_id}")
-    status=$(echo "$RESULT" | jq -r .status)
+    RESULT=$(curl $CURL_BASE_OPTS -u "$CREDS" \
+      "https://${TARGET}/mgmt/shared/iapp/package-management-tasks/${TASK_ID}")
 
-    if [[ "$status" == "FAILED" ]]; then
-      echo "❌ Échec sur $host : $(echo "$RESULT" | jq -r .errorMessage)"
+    STATUS=$(echo "$RESULT" | jq -r .status)
+
+    if [[ "$STATUS" == "FAILED" ]]; then
+      echo "❌ Échec :" \
+        "$(echo "$RESULT" | jq -r .operation)" \
+        "-" \
+        "$(echo "$RESULT" | jq -r .errorMessage)"
       return 1
     fi
   done
 }
 
-upload_rpm() {
-  local host="$1"
-  local chunks=$((RPM_SIZE / RANGE_SIZE))
+wait_for_endpoint() {
+  local TARGET="$1"
+  local ENDPOINT="$2"
+  local LABEL="$3"
 
-  echo "⬆️  Upload RPM sur $host"
-
-  for i in $(seq 0 "$chunks"); do
-    local start=$((i * RANGE_SIZE))
-    local end=$((start + RANGE_SIZE))
-    (( end > RPM_SIZE )) && end="$RPM_SIZE"
-    local offset=$((start + 1))
-
-    curl $CURL_AUTH \
-      "https://${host}/mgmt/shared/file-transfer/uploads/${RPM_NAME}" \
-      --data-binary @<(tail -c +"$offset" "$AS3_RPM_PATH") \
-      -H "Content-Type: application/octet-stream" \
-      -H "Content-Range: ${start}-$((end - 1))/${RPM_SIZE}" \
-      -H "Content-Length: $((end - start))" \
-      -o /dev/null
+  echo "🧪 Test $LABEL"
+  until curl $CURL_BASE_OPTS -u "$CREDS" \
+    --fail \
+    "https://${TARGET}${ENDPOINT}" >/dev/null; do
+    sleep 1
   done
 }
 
 #######################################
 # MAIN LOOP
 #######################################
-TOTAL=$(grep -Ev '^\s*#|^\s*$' "$DEVICES_FILE" | wc -l)
-COUNT=0
-
 echo
-echo "🚀 Installation AS3"
-echo "RPM    : $RPM_NAME"
-echo "Cibles : $TOTAL BIG-IP"
+echo "🚀 Déploiement AS3 sur plusieurs BIG-IP"
+echo "RPM : $RPM_NAME"
 echo
 
-while IFS= read -r HOST || [[ -n "$HOST" ]]; do
-  HOST=$(echo "$HOST" | tr -d '\r' | xargs)
-  [[ -z "$HOST" || "$HOST" =~ ^# ]] && continue
+while IFS= read -r LINE || [[ -n "$LINE" ]]; do
+  TARGET=$(echo "$LINE" | tr -d '\r' | xargs)
+  [[ -z "$TARGET" || "$TARGET" =~ ^# ]] && continue
 
-  COUNT=$((COUNT + 1))
   echo "======================================"
-  echo "➡️  [$COUNT/$TOTAL] BIG-IP : $HOST"
+  echo "➡️  BIG-IP : $TARGET"
   echo "======================================"
 
-  # QUERY packages
-  TASK=$(curl $CURL_AUTH -X POST \
-    "https://${HOST}/mgmt/shared/iapp/package-management-tasks" \
-    -H "$CONTENT_TYPE_JSON" \
+  ###################################
+  # QUERY existing AS3 packages
+  ###################################
+  echo "🔎 Recherche AS3 existant"
+  TASK=$(curl $CURL_BASE_OPTS -u "$CREDS" \
+    -H "Content-Type: application/json" \
+    -X POST \
+    "https://${TARGET}/mgmt/shared/iapp/package-management-tasks" \
     -d '{"operation":"QUERY"}')
 
-  poll_task "$HOST" "$(echo "$TASK" | jq -r .id)"
+  TASK_ID=$(echo "$TASK" | jq -r .id)
+  poll_task "$TARGET" "$TASK_ID"
 
-  AS3_PKGS=$(echo "$RESULT" | jq -r '.queryResponse[].packageName | select(startswith("f5-appsvcs"))')
+  AS3_PKGS=$(echo "$RESULT" | jq -r \
+    '.queryResponse[].packageName | select(startswith("f5-appsvcs"))')
 
-  # UNINSTALL anciens AS3
+  ###################################
+  # UNINSTALL existing AS3
+  ###################################
   for PKG in $AS3_PKGS; do
-    echo "🧹 Désinstallation $PKG"
-    TASK=$(curl $CURL_AUTH -X POST \
-      "https://${HOST}/mgmt/shared/iapp/package-management-tasks" \
-      -H "$CONTENT_TYPE_JSON" \
-      -d "{\"operation\":\"UNINSTALL\",\"packageName\":\"$PKG\"}")
-    poll_task "$HOST" "$(echo "$TASK" | jq -r .id)"
+    echo "🗑️  Désinstallation $PKG"
+    DATA="{\"operation\":\"UNINSTALL\",\"packageName\":\"$PKG\"}"
+
+    TASK=$(curl $CURL_BASE_OPTS -u "$CREDS" \
+      -H "Content-Type: application/json" \
+      -X POST \
+      "https://${TARGET}/mgmt/shared/iapp/package-management-tasks" \
+      -d "$DATA")
+
+    poll_task "$TARGET" "$(echo "$TASK" | jq -r .id)"
   done
 
-  # UPLOAD
-  upload_rpm "$HOST"
+  ###################################
+  # UPLOAD RPM (chunked)
+  ###################################
+  echo "⬆️  Upload AS3 RPM"
+  LEN=$(wc -c "$AS3_RPM_PATH" | awk '{print $1}')
+  CHUNKS=$(( LEN / RANGE_SIZE ))
 
-  # INSTALL
+  for i in $(seq 0 "$CHUNKS"); do
+    START=$(( i * RANGE_SIZE ))
+    END=$(( START + RANGE_SIZE ))
+    END=$(( LEN < END ? LEN : END ))
+    OFFSET=$(( START + 1 ))
+
+    curl $CURL_BASE_OPTS -u "$CREDS" \
+      -X POST \
+      "https://${TARGET}/mgmt/shared/file-transfer/uploads/${RPM_NAME}" \
+      --data-binary @<(tail -c +$OFFSET "$AS3_RPM_PATH") \
+      -H "Content-Type: application/octet-stream" \
+      -H "Content-Range: ${START}-$((END - 1))/${LEN}" \
+      -H "Content-Length: $((END - START))" \
+      -o /dev/null
+  done
+
+  ###################################
+  # INSTALL AS3
+  ###################################
   echo "📦 Installation AS3"
-  TASK=$(curl $CURL_AUTH -X POST \
-    "https://${HOST}/mgmt/shared/iapp/package-management-tasks" \
-    -H "$CONTENT_TYPE_JSON" \
-    -d "{\"operation\":\"INSTALL\",\"packageFilePath\":\"/var/config/rest/downloads/$RPM_NAME\"}")
+  DATA="{\"operation\":\"INSTALL\",\"packageFilePath\":\"/var/config/rest/downloads/${RPM_NAME}\"}"
 
-  poll_task "$HOST" "$(echo "$TASK" | jq -r .id)"
+  TASK=$(curl $CURL_BASE_OPTS -u "$CREDS" \
+    -H "Content-Type: application/json" \
+    -X POST \
+    "https://${TARGET}/mgmt/shared/iapp/package-management-tasks" \
+    -d "$DATA")
 
-  # WAIT API
-  echo "⏳ Attente disponibilité AS3 API"
-  until curl $CURL_AUTH --fail \
-    "https://${HOST}/mgmt/shared/appsvcs/info" >/dev/null 2>&1; do
-    sleep 2
-  done
+  poll_task "$TARGET" "$(echo "$TASK" | jq -r .id)"
 
-  echo "✅ AS3 installé sur $HOST"
+  ###################################
+  # TESTS AS3 (ÉTENDUS)
+  ###################################
+  wait_for_endpoint "$TARGET" "/mgmt/shared/appsvcs/info" "AS3 /info"
+  wait_for_endpoint "$TARGET" "/mgmt/shared/appsvcs/declare/" "AS3 /declare"
+  wait_for_endpoint "$TARGET" "/mgmt/shared/service-discovery/task" "Service Discovery"
+
+  echo "✅ AS3 opérationnel sur $TARGET"
   echo
 
 done < "$DEVICES_FILE"
 
-echo "🏁 Installation AS3 terminée sur tous les équipements"
+echo "🎯 Déploiement AS3 terminé sur tous les équipements"
