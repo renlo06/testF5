@@ -4,6 +4,7 @@ set -euo pipefail
 #######################################
 # CONFIGURATION
 #######################################
+DEVICES_FILE="devices.txt"
 AS3_RPM_PATH="/XXXXXX/f5-appsvcs-3.45.0-5.noarch.rpm"
 RANGE_SIZE=5000000
 CONTENT_TYPE_JSON="Content-Type: application/json"
