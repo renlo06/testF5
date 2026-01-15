@@ -44,7 +44,7 @@ while IFS= read -r LINE || [[ -n "$LINE" ]]; do
   echo "➡️  BIG-IP : $HOST"
   echo "======================================"
 
-  OUTPUT=$(sshpass -p "$SSH_PASS" ssh \
+  OUTPUT=$(sshpass -p "$SSH_PASS" ssh -n \
     -o StrictHostKeyChecking=no \
     -o ConnectTimeout=15 \
     -o LogLevel=Error \
