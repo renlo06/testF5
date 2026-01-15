@@ -7,7 +7,7 @@ set -euo pipefail
 DEVICES_FILE="devices.txt"
 
 # AS3 RPM
-AS3_RPM_PATH="/apps/data/f5/as3/f5-appsvcs-3.49.0-1.noarch.rpm"
+AS3_RPM_PATH="/xxxx/f5-appsvcs-3.49.0-1.noarch.rpm"
 RPM_NAME=$(basename "$AS3_RPM_PATH")
 
 # Upload tuning
@@ -70,19 +70,6 @@ poll_task() {
   done
 }
 
-wait_for_endpoint() {
-  local TARGET="$1"
-  local ENDPOINT="$2"
-  local LABEL="$3"
-
-  echo "🧪 Test $LABEL"
-  until curl $CURL_BASE_OPTS -u "$CREDS" \
-    --fail \
-    "https://${TARGET}${ENDPOINT}" >/dev/null; do
-    sleep 1
-  done
-}
-
 show_as3_info() {
   local TARGET="$1"
   local INFO
@@ -95,6 +82,23 @@ show_as3_info() {
   done
 
   echo "$INFO" | jq .
+}
+
+test_endpoint() {
+  local TARGET="$1"
+  local ENDPOINT="$2"
+  local LABEL="$3"
+
+  echo -n "🧪 Test $LABEL : "
+
+  if curl $CURL_BASE_OPTS -u "$CREDS" \
+       --fail \
+       "https://${TARGET}${ENDPOINT}" >/dev/null 2>&1; then
+    echo "✅ OK"
+  else
+    echo "❌ KO"
+    return 1
+  fi
 }
 
 #######################################
@@ -183,11 +187,12 @@ while IFS= read -r LINE || [[ -n "$LINE" ]]; do
   poll_task "$TARGET" "$(echo "$TASK" | jq -r .id)"
 
   ###################################
-  # TESTS AS3
+  # TESTS AS3 AVEC VERDICT
   ###################################
   show_as3_info "$TARGET"
-  wait_for_endpoint "$TARGET" "/mgmt/shared/appsvcs/declare/" "AS3 /declare"
-  wait_for_endpoint "$TARGET" "/mgmt/shared/service-discovery/task" "Service Discovery"
+
+  test_endpoint "$TARGET" "/mgmt/shared/appsvcs/declare/" "AS3 /declare"
+  test_endpoint "$TARGET" "/mgmt/shared/service-discovery/task" "Service Discovery"
 
   echo "✅ AS3 pleinement opérationnel sur $TARGET"
   echo
