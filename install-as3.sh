@@ -7,7 +7,7 @@ set -euo pipefail
 DEVICES_FILE="devices.txt"
 
 # AS3 RPM
-AS3_RPM_PATH="/XXXXX/f5-appsvcs-3.49.0-1.noarch.rpm"
+AS3_RPM_PATH="/apps/data/f5/as3/f5-appsvcs-3.49.0-1.noarch.rpm"
 RPM_NAME=$(basename "$AS3_RPM_PATH")
 
 # Upload tuning
@@ -81,6 +81,20 @@ wait_for_endpoint() {
     "https://${TARGET}${ENDPOINT}" >/dev/null; do
     sleep 1
   done
+}
+
+show_as3_info() {
+  local TARGET="$1"
+  local INFO
+
+  echo "🧪 AS3 /info (détails)"
+  until INFO=$(curl $CURL_BASE_OPTS -u "$CREDS" \
+    --fail \
+    "https://${TARGET}/mgmt/shared/appsvcs/info"); do
+    sleep 1
+  done
+
+  echo "$INFO" | jq .
 }
 
 #######################################
@@ -169,13 +183,13 @@ while IFS= read -r LINE || [[ -n "$LINE" ]]; do
   poll_task "$TARGET" "$(echo "$TASK" | jq -r .id)"
 
   ###################################
-  # TESTS AS3 (ÉTENDUS)
+  # TESTS AS3
   ###################################
-  wait_for_endpoint "$TARGET" "/mgmt/shared/appsvcs/info" "AS3 /info"
+  show_as3_info "$TARGET"
   wait_for_endpoint "$TARGET" "/mgmt/shared/appsvcs/declare/" "AS3 /declare"
   wait_for_endpoint "$TARGET" "/mgmt/shared/service-discovery/task" "Service Discovery"
 
-  echo "✅ AS3 opérationnel sur $TARGET"
+  echo "✅ AS3 pleinement opérationnel sur $TARGET"
   echo
 
 done < "$DEVICES_FILE"
