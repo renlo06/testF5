@@ -9,6 +9,7 @@ LOCAL_BACKUP_DIR="/backups/f5"
 REMOTE_UCS_DIR="/var/local/ucs"
 
 MAX_PARALLEL=4
+JOB_DELAY=0.5   # 500 ms entre chaque job
 
 #######################################
 # PRECHECKS
@@ -57,7 +58,7 @@ wait_for_ucs() {
     -o StrictHostKeyChecking=no \
     -o LogLevel=Error \
     "$SSH_USER@$HOST" \
-    "test -f ${REMOTE_UCS_DIR}/${UCS_NAME}"; do
+    "bash -c 'test -f ${REMOTE_UCS_DIR}/${UCS_NAME}'"; do
     sleep 2
   done
 }
@@ -78,8 +79,8 @@ backup_host() {
   local HOST="$1"
   local DATE="$2"
 
-  UCS_NAME="${HOST}_${DATE}.ucs"
-  HOST_DIR="${LOCAL_BACKUP_DIR}/${HOST}"
+  local UCS_NAME="${HOST}_${DATE}.ucs"
+  local HOST_DIR="${LOCAL_BACKUP_DIR}/${HOST}"
 
   mkdir -p "$HOST_DIR"
 
@@ -108,8 +109,9 @@ JOB_COUNT=0
 
 echo
 echo "📦 Sauvegarde UCS BIG-IP"
-echo "Date : $DATE"
-echo "Parallélisme : $MAX_PARALLEL équipements"
+echo "Date            : $DATE"
+echo "Parallélisme    : $MAX_PARALLEL équipements"
+echo "Délai lancement : ${JOB_DELAY}s"
 echo
 
 while IFS= read -r LINE || [[ -n "$LINE" ]]; do
@@ -117,6 +119,9 @@ while IFS= read -r LINE || [[ -n "$LINE" ]]; do
   [[ -z "$HOST" || "$HOST" =~ ^# ]] && continue
 
   backup_host "$HOST" "$DATE" &
+
+  # Pause 500 ms avant lancement du prochain job
+  sleep "$JOB_DELAY"
 
   JOB_COUNT=$((JOB_COUNT + 1))
 
@@ -128,7 +133,7 @@ while IFS= read -r LINE || [[ -n "$LINE" ]]; do
 
 done < "$DEVICES_FILE"
 
-# Attente de la fin de tous les jobs restants
+# Attente de tous les jobs restants
 wait
 
 echo "======================================"
