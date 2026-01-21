@@ -118,9 +118,9 @@ while IFS= read -r LINE || [[ -n "$LINE" ]]; do
   echo "======================================"
 
   ###################################
-  # QUERY existing AS3 packages
+  # QUERY existing packages
   ###################################
-  echo "🔎 Recherche AS3 existant"
+  echo "🔎 Recherche packages existants (AS3 + Service Discovery)"
   TASK=$(curl $CURL_BASE_OPTS -u "$CREDS" \
     -H "Content-Type: application/json" \
     -X POST \
@@ -133,11 +133,30 @@ while IFS= read -r LINE || [[ -n "$LINE" ]]; do
   AS3_PKGS=$(echo "$RESULT" | jq -r \
     '.queryResponse[].packageName | select(startswith("f5-appsvcs"))')
 
+  SD_PKGS=$(echo "$RESULT" | jq -r \
+    '.queryResponse[].packageName | select(startswith("f5-service-discovery"))')
+
   ###################################
-  # UNINSTALL existing AS3
+  # UNINSTALL AS3
   ###################################
   for PKG in $AS3_PKGS; do
-    echo "🗑️  Désinstallation $PKG"
+    echo "🗑️  Désinstallation AS3 : $PKG"
+    DATA="{\"operation\":\"UNINSTALL\",\"packageName\":\"$PKG\"}"
+
+    TASK=$(curl $CURL_BASE_OPTS -u "$CREDS" \
+      -H "Content-Type: application/json" \
+      -X POST \
+      "https://${TARGET}/mgmt/shared/iapp/package-management-tasks" \
+      -d "$DATA")
+
+    poll_task "$TARGET" "$(echo "$TASK" | jq -r .id)"
+  done
+
+  ###################################
+  # UNINSTALL SERVICE DISCOVERY
+  ###################################
+  for PKG in $SD_PKGS; do
+    echo "🗑️  Désinstallation Service Discovery : $PKG"
     DATA="{\"operation\":\"UNINSTALL\",\"packageName\":\"$PKG\"}"
 
     TASK=$(curl $CURL_BASE_OPTS -u "$CREDS" \
