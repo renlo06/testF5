@@ -6,9 +6,8 @@ OUTPUT_DIR="./checks"
 
 COMMAND_TYPE="VS"
 FILENAME="vs"
-# commande TMSH simplifiée pour récupérer uniquement la liste des VS et l'état
-TMSH_COMMAND='tmsh -c "list ltm virtual one-line"'
-GREP_FILTER='LTM::Virtual\|Availability'
+TMSH_COMMAND='tmsh -c "show ltm virtual one-line"'
+GREP_FILTER='LTM::Virtual|Availability'
 
 for bin in ssh sshpass date grep; do
   command -v "$bin" >/dev/null || { echo "❌ $bin requis"; exit 1; }
@@ -38,12 +37,9 @@ while IFS= read -r LINE || [[ -n "$LINE" ]]; do
   echo "➡️  BIG-IP : $HOST"
   echo "======================================"
 
-  sshpass -p "$SSH_PASS" ssh \
-    -o StrictHostKeyChecking=no \
-    -o ConnectTimeout=15 \
-    -o LogLevel=Error \
-    "$SSH_USER@$HOST" \
-    "bash -lc '${TMSH_COMMAND}'" \
+  # 🔹 Exécution directe de tmsh via SSH
+  sshpass -p "$SSH_PASS" ssh -o StrictHostKeyChecking=no -o ConnectTimeout=15 -o LogLevel=Error \
+    "$SSH_USER@$HOST" "$TMSH_COMMAND" \
     2>>"$ERROR_LOG" \
     | grep -E "$GREP_FILTER" > "$OUTPUT_FILE" || true
 
