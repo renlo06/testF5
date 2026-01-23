@@ -5,7 +5,8 @@ set -euo pipefail
 # CONFIG
 #######################################
 DEVICES_FILE="devices.txt"
-BASE_OUTPUT_DIR="./checks"
+OUTPUT_DIR="./checks"
+ERROR_LOG="./checks/errors.log"
 
 #######################################
 # PRECHECKS
@@ -22,6 +23,9 @@ done
   exit 1
 }
 
+mkdir -p "$OUTPUT_DIR"
+: > "$ERROR_LOG"
+
 #######################################
 # INPUTS
 #######################################
@@ -30,74 +34,78 @@ read -s -p "Mot de passe SSH: " SSH_PASS
 echo
 
 #######################################
-# COMMAND DEFINITIONS
+# COMMANDES TMSH (CORRIGÉES)
 #######################################
 declare -A COMMANDS
 declare -A FILENAMES
 
-COMMANDS[VS]='tmsh -c "cd /Common; show ltm virtual recursive"'
-FILENAMES[VS]='vs'
+COMMANDS[VS]='tmsh -c "show ltm virtual recursive"'
+FILENAMES[VS]="vs"
 
-COMMANDS[POOL]='tmsh -c "cd /Common; show ltm pool recursive members"'
-FILENAMES[POOL]='pools'
+COMMANDS[POOL]='tmsh -c "show ltm pool recursive members"'
+FILENAMES[POOL]="pools"
 
-COMMANDS[NODE]='tmsh -c "cd /Common; show ltm node recursive"'
-FILENAMES[NODE]='nodes'
+COMMANDS[NODE]='tmsh -c "show ltm node recursive"'
+FILENAMES[NODE]="nodes"
 
-COMMANDS[ASM_POLICY]='tmsh -c "cd /Common; list asm policy recursive"'
-FILENAMES[ASM_POLICY]='asm_policies'
+COMMANDS[ASM_POLICY]='tmsh -c "list asm policy recursive"'
+FILENAMES[ASM_POLICY]="asm_policies"
 
 #######################################
 # MAIN LOOP
 #######################################
-TIMESTAMP=$(date +"%Y%m%d-%H%M%S")
+DATE=$(date +"%Y%m%d-%H%M%S")
 
 echo
-echo "🔍 Vérification BIG-IP"
-echo "Horodatage : $TIMESTAMP"
+echo "🔍 Collecte état BIG-IP"
+echo "📅 Date : $DATE"
 echo
 
 while IFS= read -r LINE || [[ -n "$LINE" ]]; do
   HOST=$(echo "$LINE" | tr -d '\r' | xargs)
   [[ -z "$HOST" || "$HOST" =~ ^# ]] && continue
 
-  HOST_DIR="${BASE_OUTPUT_DIR}/${HOST}/${TIMESTAMP}"
-  mkdir -p "$HOST_DIR"
-
-  ERROR_LOG="${HOST_DIR}/errors.log"
-  : > "$ERROR_LOG"
-
   echo "======================================"
   echo "➡️  BIG-IP : $HOST"
   echo "======================================"
 
+  HOST_DIR="${OUTPUT_DIR}/${HOST}/${DATE}"
+  mkdir -p "$HOST_DIR"
+
   for TYPE in "${!COMMANDS[@]}"; do
-    OUTPUT_FILE="${HOST_DIR}/${FILENAMES[$TYPE]}_${TIMESTAMP}.txt"
+    FILE="${HOST_DIR}/${FILENAMES[$TYPE]}_${DATE}.txt"
 
-    echo "🔎 Vérification $TYPE"
+    echo "🔎 Collecte $TYPE"
 
-    sshpass -p "$SSH_PASS" ssh \
-      -o StrictHostKeyChecking=no \
-      -o LogLevel=Error \
-      "$SSH_USER@$HOST" \
-      "bash -lc '${COMMANDS[$TYPE]}'" \
-      > "$OUTPUT_FILE" 2>>"$ERROR_LOG" || true
+    if sshpass -p "$SSH_PASS" ssh \
+        -o StrictHostKeyChecking=no \
+        -o ConnectTimeout=15 \
+        -o LogLevel=Error \
+        "$SSH_USER@$HOST" \
+        "bash -lc '${COMMANDS[$TYPE]}'" \
+        > "$FILE" 2>>"$ERROR_LOG"; then
 
-    if [[ -s "$OUTPUT_FILE" ]]; then
-      echo "✅ $(basename "$OUTPUT_FILE") généré"
+      if [[ -s "$FILE" ]]; then
+        echo "✅ $TYPE OK → $(basename "$FILE")"
+      else
+        echo "⚠️  $TYPE vide"
+        echo "[$HOST][$TYPE] Fichier vide" >>"$ERROR_LOG"
+      fi
     else
-      echo "⚠️  Fichier vide : $(basename "$OUTPUT_FILE")"
+      echo "❌ Erreur $TYPE"
+      echo "[$HOST][$TYPE] Commande échouée" >>"$ERROR_LOG"
     fi
-  done
 
-  if [[ -s "$ERROR_LOG" ]]; then
-    echo "⚠️  Erreurs détectées (voir errors.log)"
-  else
-    rm -f "$ERROR_LOG"
-    echo "✅ Aucune erreur"
-  fi
+  done
 
   echo
 done < "$DEVICES_FILE"
 
-echo "🎯 Vérifications terminées"
+#######################################
+# SUMMARY
+#######################################
+echo "======================================"
+echo "🏁 Collecte terminée"
+echo "📂 Résultats : $OUTPUT_DIR"
+echo "📄 Erreurs   : $ERROR_LOG"
+echo "======================================"
