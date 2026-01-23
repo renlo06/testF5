@@ -23,9 +23,9 @@ while IFS= read -r LINE || [[ -n "$LINE" ]]; do
   echo "➡️  BIG-IP : $HOST"
   echo "======================================"
 
-  # ⚡ Forcer un pseudo-terminal avec -t pour que tmsh affiche la sortie
-  sshpass -p "$SSH_PASS" ssh -t -o StrictHostKeyChecking=no -o ConnectTimeout=15 \
-    "$SSH_USER@$HOST" 'tmsh -c "list ltm virtual one-line"' 2>/dev/null
+  # ⚡ méthode fiable : echo la commande dans un shell interactif
+  sshpass -p "$SSH_PASS" ssh -tt -o StrictHostKeyChecking=no -o ConnectTimeout=15 \
+    "$SSH_USER@$HOST" 'echo "show ltm virtual one-line" | tmsh' 2>/dev/null
 
   echo
 done < "$DEVICES_FILE"
