@@ -69,7 +69,6 @@ while IFS= read -r LINE || [[ -n "$LINE" ]]; do
 
   echo "======================================"
   echo "➡️  BIG-IP : $HOST"
-  echo "📂 Dossier : $HOST_DIR"
   echo "======================================"
 
   for TYPE in "${!COMMANDS[@]}"; do
@@ -81,24 +80,24 @@ while IFS= read -r LINE || [[ -n "$LINE" ]]; do
       -o StrictHostKeyChecking=no \
       -o LogLevel=Error \
       "$SSH_USER@$HOST" \
-      "${COMMANDS[$TYPE]}" \
+      "bash -lc '${COMMANDS[$TYPE]}'" \
       > "$OUTPUT_FILE" 2>>"$ERROR_LOG" || true
 
     if [[ -s "$OUTPUT_FILE" ]]; then
-      echo "✅ Résultat écrit : $(basename "$OUTPUT_FILE")"
+      echo "✅ $(basename "$OUTPUT_FILE") généré"
     else
       echo "⚠️  Fichier vide : $(basename "$OUTPUT_FILE")"
     fi
   done
 
   if [[ -s "$ERROR_LOG" ]]; then
-    echo "⚠️  Des erreurs ont été détectées (voir errors.log)"
+    echo "⚠️  Erreurs détectées (voir errors.log)"
   else
     rm -f "$ERROR_LOG"
-    echo "✅ Aucune erreur détectée"
+    echo "✅ Aucune erreur"
   fi
 
   echo
 done < "$DEVICES_FILE"
 
-echo "🎯 Vérifications terminées pour tous les équipements"
+echo "🎯 Vérifications terminées"
