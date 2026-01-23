@@ -5,15 +5,12 @@ set -euo pipefail
 # CONFIG
 #######################################
 DEVICES_FILE="devices.txt"
-BASE_OUTPUT_DIR="./audit"
-
-RUN_TIMESTAMP=$(date +%Y%m%d_%H-%M-%S)
-OUTPUT_DIR="${BASE_OUTPUT_DIR}/${RUN_TIMESTAMP}"
+BASE_DIR="./audit"
 
 #######################################
 # PRECHECKS
 #######################################
-for bin in ssh sshpass date grep; do
+for bin in ssh sshpass date; do
   command -v "$bin" >/dev/null || {
     echo "❌ $bin requis"
     exit 1
@@ -25,16 +22,35 @@ done
   exit 1
 }
 
-mkdir -p "$OUTPUT_DIR"
-
 #######################################
 # INPUTS
 #######################################
-read -p "Utilisateur SSH (admin/root): " SSH_USER
+read -p "Utilisateur SSH (root ou admin): " SSH_USER
 read -s -p "Mot de passe SSH: " SSH_PASS
 echo
 
-LOG_FILE="${OUTPUT_DIR}/audit.log"
+#######################################
+# DATE
+#######################################
+DATE=$(date +%Y%m%d-%H%M%S)
+
+#######################################
+# COMMAND DEFINITIONS
+#######################################
+declare -A COMMANDS
+declare -A FILES
+
+COMMANDS[VS]='tmsh -c "cd /; show ltm virtual recursive" | grep "LTM::Virtual\|Availability"'
+FILES[VS]='vs'
+
+COMMANDS[POOL]='tmsh -c "cd /; show ltm pool recursive members" | grep "LTM::Pool\|Availability"'
+FILES[POOL]='pools'
+
+COMMANDS[NODE]='tmsh -c "cd /; show ltm node recursive" | grep "LTM::Node\|Availability"'
+FILES[NODE]='nodes'
+
+COMMANDS[ASM_POLICY]='tmsh -c "cd /; list asm policy recursive" | grep "asm policy"'
+FILES[ASM_POLICY]='asm_policies'
 
 #######################################
 # FUNCTIONS
@@ -49,78 +65,47 @@ run_tmsh_cmd() {
     -o ConnectTimeout=15 \
     -o LogLevel=Error \
     "$SSH_USER@$HOST" \
-    "bash -c '$CMD'" \
+    "bash -lc \"$CMD\"" \
     > "$OUT_FILE" 2>>"$LOG_FILE"
 }
 
 #######################################
-# COMMAND DEFINITIONS
+# MAIN LOOP
 #######################################
-declare -A COMMANDS
-
-COMMANDS[VS]='tmsh -c "cd /; show ltm virtual recursive" | grep "LTM::Virtual\|Availability"'
-COMMANDS[POOL]='tmsh -c "cd /; show ltm pool recursive members" | grep "LTM::Pool\|Availability"'
-COMMANDS[NODE]='tmsh -c "cd /; show ltm node recursive" | grep "LTM::Node\|Availability"'
-COMMANDS[ASM_POLICY]='tmsh -c "cd /; list asm policy recursive" | grep "asm policy"'
-
-#######################################
-# MAIN
-#######################################
-echo "📊 Audit F5 démarré"
-echo "Run timestamp : $RUN_TIMESTAMP"
-echo "Résultats     : $OUTPUT_DIR"
+echo
+echo "🧪 Audit BIG-IP – VS / Pools / Nodes / ASM"
+echo "Date : $DATE"
 echo
 
 while IFS= read -r LINE || [[ -n "$LINE" ]]; do
   HOST=$(echo "$LINE" | tr -d '\r' | xargs)
   [[ -z "$HOST" || "$HOST" =~ ^# ]] && continue
 
-  FILE_TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+  HOST_DIR="${BASE_DIR}/${HOST}/${DATE}"
+  LOG_FILE="${HOST_DIR}/errors.log"
+
+  mkdir -p "$HOST_DIR"
 
   echo "======================================"
   echo "➡️  BIG-IP : $HOST"
+  echo "📁 Dossier : $HOST_DIR"
   echo "======================================"
 
-  HOST_DIR="${OUTPUT_DIR}/${HOST}"
-  LTM_DIR="${HOST_DIR}/ltm"
-  ASM_DIR="${HOST_DIR}/asm"
+  for KEY in "${!COMMANDS[@]}"; do
+    FILE_NAME="${FILES[$KEY]}_${DATE}.txt"
+    OUT_FILE="${HOST_DIR}/${FILE_NAME}"
 
-  mkdir -p "$LTM_DIR" "$ASM_DIR"
+    echo "🔍 Collecte ${KEY}"
+    run_tmsh_cmd "$HOST" "${COMMANDS[$KEY]}" "$OUT_FILE"
 
-  # VS
-  echo "🔍 VS"
-  run_tmsh_cmd \
-    "$HOST" \
-    "${COMMANDS[VS]}" \
-    "${LTM_DIR}/vs_${FILE_TIMESTAMP}.txt"
+    if [[ -s "$OUT_FILE" ]]; then
+      echo "✅ ${KEY} → $FILE_NAME"
+    else
+      echo "⚠️  ${KEY} → fichier vide"
+    fi
+  done
 
-  # POOLS
-  echo "🔍 Pools"
-  run_tmsh_cmd \
-    "$HOST" \
-    "${COMMANDS[POOL]}" \
-    "${LTM_DIR}/pools_${FILE_TIMESTAMP}.txt"
-
-  # NODES
-  echo "🔍 Nodes"
-  run_tmsh_cmd \
-    "$HOST" \
-    "${COMMANDS[NODE]}" \
-    "${LTM_DIR}/nodes_${FILE_TIMESTAMP}.txt"
-
-  # ASM
-  echo "🔍 ASM Policies"
-  run_tmsh_cmd \
-    "$HOST" \
-    "${COMMANDS[ASM_POLICY]}" \
-    "${ASM_DIR}/asm_policies_${FILE_TIMESTAMP}.txt"
-
-  echo "✅ Audit terminé pour $HOST"
   echo
-
 done < "$DEVICES_FILE"
 
-echo "======================================"
-echo "🎯 Audit F5 terminé"
-echo "Logs : $LOG_FILE"
-echo "======================================"
+echo "🎯 Audit terminé pour tous les équipements"
