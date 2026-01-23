@@ -6,10 +6,10 @@ OUTPUT_DIR="./checks"
 
 COMMAND_TYPE="VS"
 FILENAME="vs"
-# ⚡ On enlève les guillemets problématiques
-TMSH_COMMAND='tmsh -c show ltm virtual one-line'
+TMSH_COMMAND='tmsh -c "show ltm virtual one-line"'
 GREP_FILTER='LTM::Virtual|Availability'
 
+# Vérification des outils
 for bin in ssh sshpass date grep; do
   command -v "$bin" >/dev/null || { echo "❌ $bin requis"; exit 1; }
 done
@@ -38,8 +38,8 @@ while IFS= read -r LINE || [[ -n "$LINE" ]]; do
   echo "➡️  BIG-IP : $HOST"
   echo "======================================"
 
-  # 🔹 SSH direct avec la commande tmsh correctement échappée
-  sshpass -p "$SSH_PASS" ssh -o StrictHostKeyChecking=no -o ConnectTimeout=15 -o LogLevel=Error \
+  # ⚡ SSH avec tmsh correctement échappé
+  sshpass -p "$SSH_PASS" ssh -o StrictHostKeyChecking=no -o ConnectTimeout=15 \
     "$SSH_USER@$HOST" "$TMSH_COMMAND" 2>>"$ERROR_LOG" \
     | grep -E "$GREP_FILTER" > "$OUTPUT_FILE" || true
 
