@@ -5,8 +5,7 @@ set -euo pipefail
 # CONFIG
 #######################################
 DEVICES_FILE="devices.txt"
-OUTPUT_DIR="./checks"
-ERROR_LOG="./checks/errors.log"
+BASE_OUTPUT_DIR="./checks"
 
 #######################################
 # PRECHECKS
@@ -23,9 +22,6 @@ done
   exit 1
 }
 
-mkdir -p "$OUTPUT_DIR"
-: > "$ERROR_LOG"
-
 #######################################
 # INPUTS
 #######################################
@@ -34,7 +30,7 @@ read -s -p "Mot de passe SSH: " SSH_PASS
 echo
 
 #######################################
-# COMMANDES TMSH (CORRIGÉES)
+# COMMAND DEFINITIONS
 #######################################
 declare -A COMMANDS
 declare -A FILENAMES
@@ -54,49 +50,53 @@ FILENAMES[ASM_POLICY]="asm_policies"
 #######################################
 # MAIN LOOP
 #######################################
-DATE=$(date +"%Y%m%d-%H%M%S")
+TIMESTAMP=$(date +"%Y%m%d-%H%M%S")
 
 echo
 echo "🔍 Collecte état BIG-IP"
-echo "📅 Date : $DATE"
+echo "📅 Horodatage : $TIMESTAMP"
 echo
 
 while IFS= read -r LINE || [[ -n "$LINE" ]]; do
   HOST=$(echo "$LINE" | tr -d '\r' | xargs)
   [[ -z "$HOST" || "$HOST" =~ ^# ]] && continue
 
+  HOST_DIR="${BASE_OUTPUT_DIR}/${HOST}/${TIMESTAMP}"
+  mkdir -p "$HOST_DIR"
+
+  ERROR_LOG="${HOST_DIR}/errors.log"
+  : > "$ERROR_LOG"
+
   echo "======================================"
   echo "➡️  BIG-IP : $HOST"
   echo "======================================"
 
-  HOST_DIR="${OUTPUT_DIR}/${HOST}/${DATE}"
-  mkdir -p "$HOST_DIR"
-
   for TYPE in "${!COMMANDS[@]}"; do
-    FILE="${HOST_DIR}/${FILENAMES[$TYPE]}_${DATE}.txt"
-
+    OUTPUT_FILE="${HOST_DIR}/${FILENAMES[$TYPE]}_${TIMESTAMP}.txt"
     echo "🔎 Collecte $TYPE"
 
-    if sshpass -p "$SSH_PASS" ssh \
-        -o StrictHostKeyChecking=no \
-        -o ConnectTimeout=15 \
-        -o LogLevel=Error \
-        "$SSH_USER@$HOST" \
-        "bash -lc '${COMMANDS[$TYPE]}'" \
-        > "$FILE" 2>>"$ERROR_LOG"; then
+    sshpass -p "$SSH_PASS" ssh \
+      -o StrictHostKeyChecking=no \
+      -o ConnectTimeout=15 \
+      -o LogLevel=Error \
+      "$SSH_USER@$HOST" \
+      "bash -lc '${COMMANDS[$TYPE]}'" \
+      > "$OUTPUT_FILE" 2>>"$ERROR_LOG" || true
 
-      if [[ -s "$FILE" ]]; then
-        echo "✅ $TYPE OK → $(basename "$FILE")"
-      else
-        echo "⚠️  $TYPE vide"
-        echo "[$HOST][$TYPE] Fichier vide" >>"$ERROR_LOG"
-      fi
+    if [[ -s "$OUTPUT_FILE" ]]; then
+      echo "✅ $(basename "$OUTPUT_FILE") généré"
     else
-      echo "❌ Erreur $TYPE"
-      echo "[$HOST][$TYPE] Commande échouée" >>"$ERROR_LOG"
+      echo "⚠️  Fichier vide : $(basename "$OUTPUT_FILE")"
+      echo "[$HOST][$TYPE] Fichier vide" >>"$ERROR_LOG"
     fi
-
   done
+
+  if [[ -s "$ERROR_LOG" ]]; then
+    echo "⚠️  Des erreurs ont été détectées (voir errors.log)"
+  else
+    rm -f "$ERROR_LOG"
+    echo "✅ Aucune erreur"
+  fi
 
   echo
 done < "$DEVICES_FILE"
@@ -106,6 +106,5 @@ done < "$DEVICES_FILE"
 #######################################
 echo "======================================"
 echo "🏁 Collecte terminée"
-echo "📂 Résultats : $OUTPUT_DIR"
-echo "📄 Erreurs   : $ERROR_LOG"
+echo "📂 Résultats : $BASE_OUTPUT_DIR"
 echo "======================================"
