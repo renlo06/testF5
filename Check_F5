@@ -5,7 +5,7 @@ set -euo pipefail
 # CONFIG
 #######################################
 DEVICES_FILE="devices.txt"
-BASE_DIR="./audit"
+BASE_OUTPUT_DIR="./checks"
 
 #######################################
 # PRECHECKS
@@ -25,87 +25,80 @@ done
 #######################################
 # INPUTS
 #######################################
-read -p "Utilisateur SSH (root ou admin): " SSH_USER
+read -p "Utilisateur SSH (root recommandé): " SSH_USER
 read -s -p "Mot de passe SSH: " SSH_PASS
 echo
-
-#######################################
-# DATE
-#######################################
-DATE=$(date +%Y%m%d-%H%M%S)
 
 #######################################
 # COMMAND DEFINITIONS
 #######################################
 declare -A COMMANDS
-declare -A FILES
+declare -A FILENAMES
 
-COMMANDS[VS]='tmsh -c "cd /; show ltm virtual recursive" | grep "LTM::Virtual\|Availability"'
-FILES[VS]='vs'
+COMMANDS[VS]='tmsh -c "cd /Common; show ltm virtual recursive"'
+FILENAMES[VS]='vs'
 
-COMMANDS[POOL]='tmsh -c "cd /; show ltm pool recursive members" | grep "LTM::Pool\|Availability"'
-FILES[POOL]='pools'
+COMMANDS[POOL]='tmsh -c "cd /Common; show ltm pool recursive members"'
+FILENAMES[POOL]='pools'
 
-COMMANDS[NODE]='tmsh -c "cd /; show ltm node recursive" | grep "LTM::Node\|Availability"'
-FILES[NODE]='nodes'
+COMMANDS[NODE]='tmsh -c "cd /Common; show ltm node recursive"'
+FILENAMES[NODE]='nodes'
 
-COMMANDS[ASM_POLICY]='tmsh -c "cd /; list asm policy recursive" | grep "asm policy"'
-FILES[ASM_POLICY]='asm_policies'
-
-#######################################
-# FUNCTIONS
-#######################################
-run_tmsh_cmd() {
-  local HOST="$1"
-  local CMD="$2"
-  local OUT_FILE="$3"
-
-  sshpass -p "$SSH_PASS" ssh \
-    -o StrictHostKeyChecking=no \
-    -o ConnectTimeout=15 \
-    -o LogLevel=Error \
-    "$SSH_USER@$HOST" \
-    "bash -lc \"$CMD\"" \
-    > "$OUT_FILE" 2>>"$LOG_FILE"
-}
+COMMANDS[ASM_POLICY]='tmsh -c "cd /Common; list asm policy recursive"'
+FILENAMES[ASM_POLICY]='asm_policies'
 
 #######################################
 # MAIN LOOP
 #######################################
+TIMESTAMP=$(date +"%Y%m%d-%H%M%S")
+
 echo
-echo "🧪 Audit BIG-IP – VS / Pools / Nodes / ASM"
-echo "Date : $DATE"
+echo "🔍 Vérification BIG-IP"
+echo "Horodatage : $TIMESTAMP"
 echo
 
 while IFS= read -r LINE || [[ -n "$LINE" ]]; do
   HOST=$(echo "$LINE" | tr -d '\r' | xargs)
   [[ -z "$HOST" || "$HOST" =~ ^# ]] && continue
 
-  HOST_DIR="${BASE_DIR}/${HOST}/${DATE}"
-  LOG_FILE="${HOST_DIR}/errors.log"
-
+  HOST_DIR="${BASE_OUTPUT_DIR}/${HOST}/${TIMESTAMP}"
   mkdir -p "$HOST_DIR"
+
+  ERROR_LOG="${HOST_DIR}/errors.log"
+  : > "$ERROR_LOG"
 
   echo "======================================"
   echo "➡️  BIG-IP : $HOST"
-  echo "📁 Dossier : $HOST_DIR"
+  echo "📂 Dossier : $HOST_DIR"
   echo "======================================"
 
-  for KEY in "${!COMMANDS[@]}"; do
-    FILE_NAME="${FILES[$KEY]}_${DATE}.txt"
-    OUT_FILE="${HOST_DIR}/${FILE_NAME}"
+  for TYPE in "${!COMMANDS[@]}"; do
+    OUTPUT_FILE="${HOST_DIR}/${FILENAMES[$TYPE]}_${TIMESTAMP}.txt"
 
-    echo "🔍 Collecte ${KEY}"
-    run_tmsh_cmd "$HOST" "${COMMANDS[$KEY]}" "$OUT_FILE"
+    echo "🔎 Vérification $TYPE"
 
-    if [[ -s "$OUT_FILE" ]]; then
-      echo "✅ ${KEY} → $FILE_NAME"
+    sshpass -p "$SSH_PASS" ssh \
+      -o StrictHostKeyChecking=no \
+      -o LogLevel=Error \
+      "$SSH_USER@$HOST" \
+      "${COMMANDS[$TYPE]}" \
+      > "$OUTPUT_FILE" 2>>"$ERROR_LOG" || true
+
+    if [[ -s "$OUTPUT_FILE" ]]; then
+      echo "✅ Résultat écrit : $(basename "$OUTPUT_FILE")"
     else
-      echo "⚠️  ${KEY} → fichier vide"
+      echo "⚠️  Fichier vide : $(basename "$OUTPUT_FILE")"
     fi
   done
+
+  if [[ -s "$ERROR_LOG" ]]; then
+    echo "⚠️  Des erreurs ont été détectées (voir errors.log)"
+  else
+    rm -f "$ERROR_LOG"
+    echo "✅ Aucune erreur détectée"
+  fi
 
   echo
 done < "$DEVICES_FILE"
 
-echo "🎯 Audit terminé pour tous les équipements"
+echo "🎯 Vérifications terminées pour tous les équipements"
