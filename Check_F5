@@ -1,34 +1,208 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+#######################################
+# CONFIG
+#######################################
 DEVICES_FILE="devices.txt"
+OUT_BASE="./inventory"
+TS=$(date +%Y%m%d-%H%M%S)
 
-for bin in ssh sshpass; do
+TOP=10000
+
+#######################################
+# PRECHECKS
+#######################################
+for bin in curl jq date; do
   command -v "$bin" >/dev/null || { echo "❌ $bin requis"; exit 1; }
 done
 
 [[ -f "$DEVICES_FILE" ]] || { echo "❌ Fichier équipements introuvable : $DEVICES_FILE"; exit 1; }
+mkdir -p "$OUT_BASE"
 
-read -p "Utilisateur SSH (root recommandé): " SSH_USER
-read -s -p "Mot de passe SSH: " SSH_PASS
+#######################################
+# INPUTS
+#######################################
+read -p "Utilisateur API (ex: admin): " API_USER
+read -s -p "Mot de passe API: " API_PASS
 echo
 
-echo "🔍 Vérification des Virtual Servers"
+AUTH=(-u "${API_USER}:${API_PASS}" -k -sS)
+
+#######################################
+# FUNCTIONS: REST FETCH
+#######################################
+fetch_json() {
+  local host="$1"
+  local url="$2"
+  curl "${AUTH[@]}" "https://${host}${url}"
+}
+
+#######################################
+# FUNCTIONS: STATS MAPPING (jq)
+# Build a map: fullPath -> availability (best-effort)
+#######################################
+stats_to_avail_map_jq='
+  def key_to_fullpath:
+    # keys often look like: https://localhost/mgmt/tm/ltm/virtual/~Common~vs1/stats
+    # extract ~Common~vs1 and convert to /Common/vs1
+    ( . | capture("~(?<p>[^~]+)~(?<n>[^/]+)")? )
+    | if . == null then null else ("/" + .p + "/" + .n) end;
+
+  def pick_avail($e):
+    # Try common fields found in nestedStats
+    (
+      $e.nestedStats.entries.availabilityState.description? //
+      $e.nestedStats.entries.status_availabilityState.description? //
+      $e.nestedStats.entries.status.description? //
+      $e.nestedStats.entries.availability.description? //
+      $e.nestedStats.entries."availState".description? //
+      $e.nestedStats.entries."availabilityState".description? //
+      empty
+    );
+
+  reduce (.entries // {} | to_entries[]) as $it ({}; 
+    ($it.key | key_to_fullpath) as $fp
+    | if $fp == null then . else . + { ($fp): (pick_avail($it.value) // "UNKNOWN") } end
+  )
+'
+
+#######################################
+# FUNCTIONS: MERGE CONFIG + AVAIL -> CSV
+#######################################
+vs_csv_jq='
+  def csv_header: ["fullPath","enabled","disabled","destination","ipProtocol","availability"] | @csv;
+  csv_header,
+  (.items[]? | [
+    .fullPath,
+    (.enabled // ""),
+    (.disabled // ""),
+    (.destination // ""),
+    (.ipProtocol // ""),
+    ($avail[.fullPath] // "UNKNOWN")
+  ] | @csv)
+'
+
+pools_csv_jq='
+  def csv_header: ["fullPath","members","loadBalancingMode","availability"] | @csv;
+  csv_header,
+  (.items[]? | [
+    .fullPath,
+    (.members // "" | tostring),
+    (.loadBalancingMode // ""),
+    ($avail[.fullPath] // "UNKNOWN")
+  ] | @csv)
+'
+
+nodes_csv_jq='
+  def csv_header: ["fullPath","address","availability"] | @csv;
+  csv_header,
+  (.items[]? | [
+    .fullPath,
+    (.address // ""),
+    ($avail[.fullPath] // "UNKNOWN")
+  ] | @csv)
+'
+
+asm_csv_jq='
+  def csv_header: ["name","id","fullPath"] | @csv;
+  csv_header,
+  (.items[]? | [
+    (.name // ""),
+    (.id // ""),
+    (.fullPath // "")
+  ] | @csv)
+'
+
+#######################################
+# MAIN
+#######################################
+echo
+echo "📋 Inventaire REST (VS/Pool/Node + Availability) + ASM Policies"
+echo "Horodatage : $TS"
+echo "Sortie     : $OUT_BASE"
+echo
 
 while IFS= read -r LINE || [[ -n "$LINE" ]]; do
   HOST=$(echo "$LINE" | tr -d '\r' | xargs)
   [[ -z "$HOST" || "$HOST" =~ ^# ]] && continue
 
+  HOST_DIR="${OUT_BASE}/${HOST}/${TS}"
+  mkdir -p "$HOST_DIR"
+
   echo "======================================"
   echo "➡️  BIG-IP : $HOST"
+  echo "📂 $HOST_DIR"
   echo "======================================"
 
-  # ⚡ méthode fiable : echo la commande dans un shell interactif
-  sshpass -p "$SSH_PASS" ssh -tt -o StrictHostKeyChecking=no -o ConnectTimeout=15 \
-    "$SSH_USER@$HOST" 'echo "show ltm virtual one-line" | tmsh' 2>/dev/null
+  # ---------------------------
+  # VS: config + stats + CSV
+  # ---------------------------
+  VS_CFG="${HOST_DIR}/vs_config.json"
+  VS_STATS="${HOST_DIR}/vs_stats.json"
+  VS_CSV="${HOST_DIR}/vs_inventory.csv"
+  VS_ERR="${HOST_DIR}/vs_errors.log"
+
+  if fetch_json "$HOST" "/mgmt/tm/ltm/virtual?\$select=fullPath,enabled,disabled,destination,ipProtocol&\$top=${TOP}" >"$VS_CFG" 2>"$VS_ERR"; then
+    fetch_json "$HOST" "/mgmt/tm/ltm/virtual/stats?\$top=${TOP}" >"$VS_STATS" 2>>"$VS_ERR" || true
+    AVAIL=$(jq -c "$stats_to_avail_map_jq" "$VS_STATS" 2>/dev/null || echo '{}')
+    jq --argjson avail "$AVAIL" -r "$vs_csv_jq" "$VS_CFG" >"$VS_CSV"
+    echo "✅ VS: $(jq -r '.items|length' "$VS_CFG") (CSV + JSON + STATS)"
+  else
+    echo "❌ VS: échec (voir $VS_ERR)"
+  fi
+
+  # ---------------------------
+  # POOLS: config + stats + CSV
+  # ---------------------------
+  POOL_CFG="${HOST_DIR}/pools_config.json"
+  POOL_STATS="${HOST_DIR}/pools_stats.json"
+  POOL_CSV="${HOST_DIR}/pools_inventory.csv"
+  POOL_ERR="${HOST_DIR}/pools_errors.log"
+
+  if fetch_json "$HOST" "/mgmt/tm/ltm/pool?\$select=fullPath,members,loadBalancingMode&\$top=${TOP}" >"$POOL_CFG" 2>"$POOL_ERR"; then
+    fetch_json "$HOST" "/mgmt/tm/ltm/pool/stats?\$top=${TOP}" >"$POOL_STATS" 2>>"$POOL_ERR" || true
+    AVAIL=$(jq -c "$stats_to_avail_map_jq" "$POOL_STATS" 2>/dev/null || echo '{}')
+    jq --argjson avail "$AVAIL" -r "$pools_csv_jq" "$POOL_CFG" >"$POOL_CSV"
+    echo "✅ Pools: $(jq -r '.items|length' "$POOL_CFG") (CSV + JSON + STATS)"
+  else
+    echo "❌ Pools: échec (voir $POOL_ERR)"
+  fi
+
+  # ---------------------------
+  # NODES: config + stats + CSV
+  # ---------------------------
+  NODE_CFG="${HOST_DIR}/nodes_config.json"
+  NODE_STATS="${HOST_DIR}/nodes_stats.json"
+  NODE_CSV="${HOST_DIR}/nodes_inventory.csv"
+  NODE_ERR="${HOST_DIR}/nodes_errors.log"
+
+  if fetch_json "$HOST" "/mgmt/tm/ltm/node?\$select=fullPath,address&\$top=${TOP}" >"$NODE_CFG" 2>"$NODE_ERR"; then
+    fetch_json "$HOST" "/mgmt/tm/ltm/node/stats?\$top=${TOP}" >"$NODE_STATS" 2>>"$NODE_ERR" || true
+    AVAIL=$(jq -c "$stats_to_avail_map_jq" "$NODE_STATS" 2>/dev/null || echo '{}')
+    jq --argjson avail "$AVAIL" -r "$nodes_csv_jq" "$NODE_CFG" >"$NODE_CSV"
+    echo "✅ Nodes: $(jq -r '.items|length' "$NODE_CFG") (CSV + JSON + STATS)"
+  else
+    echo "❌ Nodes: échec (voir $NODE_ERR)"
+  fi
+
+  # ---------------------------
+  # ASM Policies: config + CSV
+  # Endpoint can vary depending on ASM provisioning/version.
+  # Most commonly: /mgmt/tm/asm/policies
+  # ---------------------------
+  ASM_JSON="${HOST_DIR}/asm_policies.json"
+  ASM_CSV="${HOST_DIR}/asm_policies.csv"
+  ASM_ERR="${HOST_DIR}/asm_errors.log"
+
+  if fetch_json "$HOST" "/mgmt/tm/asm/policies?\$select=name,id,fullPath&\$top=${TOP}" >"$ASM_JSON" 2>"$ASM_ERR"; then
+    jq -r "$asm_csv_jq" "$ASM_JSON" >"$ASM_CSV"
+    echo "✅ ASM Policies: $(jq -r '.items|length' "$ASM_JSON") (CSV + JSON)"
+  else
+    echo "⚠️ ASM Policies: endpoint non accessible (module ASM absent/droits). Voir $ASM_ERR"
+  fi
 
   echo
 done < "$DEVICES_FILE"
 
-echo "======================================"
-echo "🏁 Vérification terminée"
+echo "🏁 Terminé"
