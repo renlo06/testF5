@@ -7,7 +7,6 @@ set -euo pipefail
 DEVICES_FILE="devices.txt"
 OUT_BASE="./inventory"
 TS=$(date +%Y%m%d-%H%M%S)
-
 TOP=10000
 
 #######################################
@@ -17,7 +16,10 @@ for bin in curl jq date; do
   command -v "$bin" >/dev/null || { echo "❌ $bin requis"; exit 1; }
 done
 
-[[ -f "$DEVICES_FILE" ]] || { echo "❌ Fichier équipements introuvable : $DEVICES_FILE"; exit 1; }
+[[ -f "$DEVICES_FILE" ]] || {
+  echo "❌ Fichier équipements introuvable : $DEVICES_FILE"
+  exit 1
+}
 mkdir -p "$OUT_BASE"
 
 #######################################
@@ -30,34 +32,19 @@ echo
 AUTH=(-u "${API_USER}:${API_PASS}" -k -sS)
 
 #######################################
-# FUNCTIONS: REST FETCH
-#######################################
-fetch_json() {
-  local host="$1"
-  local url="$2"
-  curl "${AUTH[@]}" "https://${host}${url}"
-}
-
-#######################################
-# FUNCTIONS: STATS MAPPING (jq)
-# Build a map: fullPath -> availability (best-effort)
+# JQ HELPERS
 #######################################
 stats_to_avail_map_jq='
   def key_to_fullpath:
-    # keys often look like: https://localhost/mgmt/tm/ltm/virtual/~Common~vs1/stats
-    # extract ~Common~vs1 and convert to /Common/vs1
     ( . | capture("~(?<p>[^~]+)~(?<n>[^/]+)")? )
     | if . == null then null else ("/" + .p + "/" + .n) end;
 
   def pick_avail($e):
-    # Try common fields found in nestedStats
     (
       $e.nestedStats.entries.availabilityState.description? //
       $e.nestedStats.entries.status_availabilityState.description? //
       $e.nestedStats.entries.status.description? //
       $e.nestedStats.entries.availability.description? //
-      $e.nestedStats.entries."availState".description? //
-      $e.nestedStats.entries."availabilityState".description? //
       empty
     );
 
@@ -67,12 +54,8 @@ stats_to_avail_map_jq='
   )
 '
 
-#######################################
-# FUNCTIONS: MERGE CONFIG + AVAIL -> CSV
-#######################################
 vs_csv_jq='
-  def csv_header: ["fullPath","enabled","disabled","destination","ipProtocol","availability"] | @csv;
-  csv_header,
+  (["fullPath","enabled","disabled","destination","ipProtocol","availability"] | @csv),
   (.items[]? | [
     .fullPath,
     (.enabled // ""),
@@ -84,8 +67,7 @@ vs_csv_jq='
 '
 
 pools_csv_jq='
-  def csv_header: ["fullPath","members","loadBalancingMode","availability"] | @csv;
-  csv_header,
+  (["fullPath","members","loadBalancingMode","availability"] | @csv),
   (.items[]? | [
     .fullPath,
     (.members // "" | tostring),
@@ -95,8 +77,7 @@ pools_csv_jq='
 '
 
 nodes_csv_jq='
-  def csv_header: ["fullPath","address","availability"] | @csv;
-  csv_header,
+  (["fullPath","address","availability"] | @csv),
   (.items[]? | [
     .fullPath,
     (.address // ""),
@@ -105,8 +86,7 @@ nodes_csv_jq='
 '
 
 asm_csv_jq='
-  def csv_header: ["name","id","fullPath"] | @csv;
-  csv_header,
+  (["name","id","fullPath"] | @csv),
   (.items[]? | [
     (.name // ""),
     (.id // ""),
@@ -118,9 +98,8 @@ asm_csv_jq='
 # MAIN
 #######################################
 echo
-echo "📋 Inventaire REST (VS/Pool/Node + Availability) + ASM Policies"
-echo "Horodatage : $TS"
-echo "Sortie     : $OUT_BASE"
+echo "📋 Inventaire BIG-IP (REST) — CSV uniquement"
+echo "📅 Horodatage : $TS"
 echo
 
 while IFS= read -r LINE || [[ -n "$LINE" ]]; do
@@ -132,77 +111,71 @@ while IFS= read -r LINE || [[ -n "$LINE" ]]; do
 
   echo "======================================"
   echo "➡️  BIG-IP : $HOST"
-  echo "📂 $HOST_DIR"
   echo "======================================"
 
-  # ---------------------------
-  # VS: config + stats + CSV
-  # ---------------------------
-  VS_CFG="${HOST_DIR}/vs_config.json"
-  VS_STATS="${HOST_DIR}/vs_stats.json"
-  VS_CSV="${HOST_DIR}/vs_inventory.csv"
-  VS_ERR="${HOST_DIR}/vs_errors.log"
+  ###################################
+  # VIRTUAL SERVERS
+  ###################################
+  echo "🔎 VS"
+  VS_CFG=$(curl "${AUTH[@]}" \
+    "https://${HOST}/mgmt/tm/ltm/virtual?\$select=fullPath,enabled,disabled,destination,ipProtocol&\$top=${TOP}")
 
-  if fetch_json "$HOST" "/mgmt/tm/ltm/virtual?\$select=fullPath,enabled,disabled,destination,ipProtocol&\$top=${TOP}" >"$VS_CFG" 2>"$VS_ERR"; then
-    fetch_json "$HOST" "/mgmt/tm/ltm/virtual/stats?\$top=${TOP}" >"$VS_STATS" 2>>"$VS_ERR" || true
-    AVAIL=$(jq -c "$stats_to_avail_map_jq" "$VS_STATS" 2>/dev/null || echo '{}')
-    jq --argjson avail "$AVAIL" -r "$vs_csv_jq" "$VS_CFG" >"$VS_CSV"
-    echo "✅ VS: $(jq -r '.items|length' "$VS_CFG") (CSV + JSON + STATS)"
-  else
-    echo "❌ VS: échec (voir $VS_ERR)"
-  fi
+  VS_STATS=$(curl "${AUTH[@]}" \
+    "https://${HOST}/mgmt/tm/ltm/virtual/stats?\$top=${TOP}" || echo '{}')
 
-  # ---------------------------
-  # POOLS: config + stats + CSV
-  # ---------------------------
-  POOL_CFG="${HOST_DIR}/pools_config.json"
-  POOL_STATS="${HOST_DIR}/pools_stats.json"
-  POOL_CSV="${HOST_DIR}/pools_inventory.csv"
-  POOL_ERR="${HOST_DIR}/pools_errors.log"
+  AVAIL=$(jq -c "$stats_to_avail_map_jq" <<<"$VS_STATS" 2>/dev/null || echo '{}')
 
-  if fetch_json "$HOST" "/mgmt/tm/ltm/pool?\$select=fullPath,members,loadBalancingMode&\$top=${TOP}" >"$POOL_CFG" 2>"$POOL_ERR"; then
-    fetch_json "$HOST" "/mgmt/tm/ltm/pool/stats?\$top=${TOP}" >"$POOL_STATS" 2>>"$POOL_ERR" || true
-    AVAIL=$(jq -c "$stats_to_avail_map_jq" "$POOL_STATS" 2>/dev/null || echo '{}')
-    jq --argjson avail "$AVAIL" -r "$pools_csv_jq" "$POOL_CFG" >"$POOL_CSV"
-    echo "✅ Pools: $(jq -r '.items|length' "$POOL_CFG") (CSV + JSON + STATS)"
-  else
-    echo "❌ Pools: échec (voir $POOL_ERR)"
-  fi
+  jq --argjson avail "$AVAIL" -r "$vs_csv_jq" <<<"$VS_CFG" \
+    > "${HOST_DIR}/vs_inventory.csv"
 
-  # ---------------------------
-  # NODES: config + stats + CSV
-  # ---------------------------
-  NODE_CFG="${HOST_DIR}/nodes_config.json"
-  NODE_STATS="${HOST_DIR}/nodes_stats.json"
-  NODE_CSV="${HOST_DIR}/nodes_inventory.csv"
-  NODE_ERR="${HOST_DIR}/nodes_errors.log"
+  echo "✅ VS exportés"
 
-  if fetch_json "$HOST" "/mgmt/tm/ltm/node?\$select=fullPath,address&\$top=${TOP}" >"$NODE_CFG" 2>"$NODE_ERR"; then
-    fetch_json "$HOST" "/mgmt/tm/ltm/node/stats?\$top=${TOP}" >"$NODE_STATS" 2>>"$NODE_ERR" || true
-    AVAIL=$(jq -c "$stats_to_avail_map_jq" "$NODE_STATS" 2>/dev/null || echo '{}')
-    jq --argjson avail "$AVAIL" -r "$nodes_csv_jq" "$NODE_CFG" >"$NODE_CSV"
-    echo "✅ Nodes: $(jq -r '.items|length' "$NODE_CFG") (CSV + JSON + STATS)"
-  else
-    echo "❌ Nodes: échec (voir $NODE_ERR)"
-  fi
+  ###################################
+  # POOLS
+  ###################################
+  echo "🔎 Pools"
+  POOL_CFG=$(curl "${AUTH[@]}" \
+    "https://${HOST}/mgmt/tm/ltm/pool?\$select=fullPath,members,loadBalancingMode&\$top=${TOP}")
 
-  # ---------------------------
-  # ASM Policies: config + CSV
-  # Endpoint can vary depending on ASM provisioning/version.
-  # Most commonly: /mgmt/tm/asm/policies
-  # ---------------------------
-  ASM_JSON="${HOST_DIR}/asm_policies.json"
-  ASM_CSV="${HOST_DIR}/asm_policies.csv"
-  ASM_ERR="${HOST_DIR}/asm_errors.log"
+  POOL_STATS=$(curl "${AUTH[@]}" \
+    "https://${HOST}/mgmt/tm/ltm/pool/stats?\$top=${TOP}" || echo '{}')
 
-  if fetch_json "$HOST" "/mgmt/tm/asm/policies?\$select=name,id,fullPath&\$top=${TOP}" >"$ASM_JSON" 2>"$ASM_ERR"; then
-    jq -r "$asm_csv_jq" "$ASM_JSON" >"$ASM_CSV"
-    echo "✅ ASM Policies: $(jq -r '.items|length' "$ASM_JSON") (CSV + JSON)"
-  else
-    echo "⚠️ ASM Policies: endpoint non accessible (module ASM absent/droits). Voir $ASM_ERR"
-  fi
+  AVAIL=$(jq -c "$stats_to_avail_map_jq" <<<"$POOL_STATS" 2>/dev/null || echo '{}')
 
+  jq --argjson avail "$AVAIL" -r "$pools_csv_jq" <<<"$POOL_CFG" \
+    > "${HOST_DIR}/pools_inventory.csv"
+
+  echo "✅ Pools exportés"
+
+  ###################################
+  # NODES
+  ###################################
+  echo "🔎 Nodes"
+  NODE_CFG=$(curl "${AUTH[@]}" \
+    "https://${HOST}/mgmt/tm/ltm/node?\$select=fullPath,address&\$top=${TOP}")
+
+  NODE_STATS=$(curl "${AUTH[@]}" \
+    "https://${HOST}/mgmt/tm/ltm/node/stats?\$top=${TOP}" || echo '{}')
+
+  AVAIL=$(jq -c "$stats_to_avail_map_jq" <<<"$NODE_STATS" 2>/dev/null || echo '{}')
+
+  jq --argjson avail "$AVAIL" -r "$nodes_csv_jq" <<<"$NODE_CFG" \
+    > "${HOST_DIR}/nodes_inventory.csv"
+
+  echo "✅ Nodes exportés"
+
+  ###################################
+  # ASM POLICIES
+  ###################################
+  echo "🔎 ASM Policies"
+  ASM_JSON=$(curl "${AUTH[@]}" \
+    "https://${HOST}/mgmt/tm/asm/policies?\$select=name,id,fullPath&\$top=${TOP}" || echo '{}')
+
+  jq -r "$asm_csv_jq" <<<"$ASM_JSON" \
+    > "${HOST_DIR}/asm_policies.csv"
+
+  echo "✅ ASM policies exportées"
   echo
 done < "$DEVICES_FILE"
 
-echo "🏁 Terminé"
+echo "🏁 Inventaire terminé (CSV uniquement)"
