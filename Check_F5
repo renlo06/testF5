@@ -1,36 +1,23 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-#######################################
-# CONFIG
-#######################################
 DEVICES_FILE="devices.txt"
 OUT_BASE="./inventory"
 TS=$(date +%Y%m%d-%H%M%S)
 TOP=10000
 
-#######################################
-# PRECHECKS
-#######################################
 for bin in curl jq date; do
   command -v "$bin" >/dev/null || { echo "❌ $bin requis"; exit 1; }
 done
-
 [[ -f "$DEVICES_FILE" ]] || { echo "❌ Fichier équipements introuvable : $DEVICES_FILE"; exit 1; }
 mkdir -p "$OUT_BASE"
 
-#######################################
-# INPUTS
-#######################################
 read -p "Utilisateur API (ex: admin): " API_USER
 read -s -p "Mot de passe API: " API_PASS
 echo
 
 AUTH=(-u "${API_USER}:${API_PASS}" -k -sS)
 
-#######################################
-# GLOBAL SUMMARY OUTPUTS
-#######################################
 SUMMARY_CSV="${OUT_BASE}/summary_${TS}.csv"
 SUMMARY_TXT="${OUT_BASE}/summary_${TS}.txt"
 
@@ -40,9 +27,6 @@ echo 'host,vs_total,vs_ok,vs_ko,vs_unknown,pools_total,pools_ok,pools_ko,pools_u
   echo
 } > "$SUMMARY_TXT"
 
-#######################################
-# JQ HELPERS
-#######################################
 stats_to_avail_map_jq='
   def key_to_fullpath:
     ( . | capture("~(?<p>[^~]+)~(?<n>[^/]+)")? )
@@ -123,9 +107,6 @@ asm_csv_jq='
   ] | @csv)
 '
 
-#######################################
-# MAIN
-#######################################
 echo
 echo "📋 Inventaire BIG-IP (REST) — CSV + synthèse CSV/TXT"
 echo "📅 Horodatage : $TS"
@@ -144,53 +125,44 @@ while IFS= read -r LINE || [[ -n "$LINE" ]]; do
   echo "➡️  BIG-IP : $HOST"
   echo "======================================"
 
-  ###################################
   # VS
-  ###################################
   echo "🔎 VS"
   VS_CFG=$(curl "${AUTH[@]}" "https://${HOST}/mgmt/tm/ltm/virtual?\$select=fullPath,enabled,disabled,destination,ipProtocol&\$top=${TOP}")
   VS_STATS=$(curl "${AUTH[@]}" "https://${HOST}/mgmt/tm/ltm/virtual/stats?\$top=${TOP}" || echo '{}')
   VS_AVAIL=$(jq -c "$stats_to_avail_map_jq" <<<"$VS_STATS" 2>/dev/null || echo '{}')
   jq --argjson avail "$VS_AVAIL" -r "$vs_csv_jq" <<<"$VS_CFG" > "${HOST_DIR}/vs_inventory.csv"
-  read -r VS_TOTAL VS_OK VS_KO VS_UNK < <(jq --argjson avail "$VS_AVAIL" -r "$count_status_jq" <<<"$VS_CFG")
+  VS_COUNTS=$(jq --argjson avail "$VS_AVAIL" -r "$count_status_jq" <<<"$VS_CFG" 2>/dev/null || echo $'0\t0\t0\t0')
+  IFS=$'\t' read -r VS_TOTAL VS_OK VS_KO VS_UNK <<<"$VS_COUNTS"
 
-  ###################################
-  # POOLS
-  ###################################
+  # Pools
   echo "🔎 Pools"
   POOL_CFG=$(curl "${AUTH[@]}" "https://${HOST}/mgmt/tm/ltm/pool?\$select=fullPath,members,loadBalancingMode&\$top=${TOP}")
   POOL_STATS=$(curl "${AUTH[@]}" "https://${HOST}/mgmt/tm/ltm/pool/stats?\$top=${TOP}" || echo '{}')
   POOL_AVAIL=$(jq -c "$stats_to_avail_map_jq" <<<"$POOL_STATS" 2>/dev/null || echo '{}')
   jq --argjson avail "$POOL_AVAIL" -r "$pools_csv_jq" <<<"$POOL_CFG" > "${HOST_DIR}/pools_inventory.csv"
-  read -r POOL_TOTAL POOL_OK POOL_KO POOL_UNK < <(jq --argjson avail "$POOL_AVAIL" -r "$count_status_jq" <<<"$POOL_CFG")
+  POOL_COUNTS=$(jq --argjson avail "$POOL_AVAIL" -r "$count_status_jq" <<<"$POOL_CFG" 2>/dev/null || echo $'0\t0\t0\t0')
+  IFS=$'\t' read -r POOL_TOTAL POOL_OK POOL_KO POOL_UNK <<<"$POOL_COUNTS"
 
-  ###################################
-  # NODES
-  ###################################
+  # Nodes
   echo "🔎 Nodes"
   NODE_CFG=$(curl "${AUTH[@]}" "https://${HOST}/mgmt/tm/ltm/node?\$select=fullPath,address&\$top=${TOP}")
   NODE_STATS=$(curl "${AUTH[@]}" "https://${HOST}/mgmt/tm/ltm/node/stats?\$top=${TOP}" || echo '{}')
   NODE_AVAIL=$(jq -c "$stats_to_avail_map_jq" <<<"$NODE_STATS" 2>/dev/null || echo '{}')
   jq --argjson avail "$NODE_AVAIL" -r "$nodes_csv_jq" <<<"$NODE_CFG" > "${HOST_DIR}/nodes_inventory.csv"
-  read -r NODE_TOTAL NODE_OK NODE_KO NODE_UNK < <(jq --argjson avail "$NODE_AVAIL" -r "$count_status_jq" <<<"$NODE_CFG")
+  NODE_COUNTS=$(jq --argjson avail "$NODE_AVAIL" -r "$count_status_jq" <<<"$NODE_CFG" 2>/dev/null || echo $'0\t0\t0\t0')
+  IFS=$'\t' read -r NODE_TOTAL NODE_OK NODE_KO NODE_UNK <<<"$NODE_COUNTS"
 
-  ###################################
-  # ASM POLICIES
-  ###################################
+  # ASM
   echo "🔎 ASM Policies"
   ASM_JSON=$(curl "${AUTH[@]}" "https://${HOST}/mgmt/tm/asm/policies?\$select=name,id,fullPath&\$top=${TOP}" || echo '{}')
   jq -r "$asm_csv_jq" <<<"$ASM_JSON" > "${HOST_DIR}/asm_policies.csv"
   ASM_TOTAL=$(jq -r '(.items // []) | length' <<<"$ASM_JSON")
 
-  ###################################
-  # SUMMARY CSV
-  ###################################
+  # Summary CSV
   echo "${HOST},${VS_TOTAL},${VS_OK},${VS_KO},${VS_UNK},${POOL_TOTAL},${POOL_OK},${POOL_KO},${POOL_UNK},${NODE_TOTAL},${NODE_OK},${NODE_KO},${NODE_UNK},${ASM_TOTAL}" \
     >> "$SUMMARY_CSV"
 
-  ###################################
-  # SUMMARY TXT (UP/DOWN/UNKNOWN)
-  ###################################
+  # Summary TXT (UP/DOWN/UNKNOWN)
   {
     echo "Host: $HOST"
     echo "  VS    : total=${VS_TOTAL}  up=${VS_OK}  down=${VS_KO}  unknown=${VS_UNK}"
