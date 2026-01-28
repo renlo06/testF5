@@ -63,22 +63,23 @@ stats_to_avail_map_jq='
   )
 '
 
-count_status_obj_jq='
+# => sort: total \t up \t down \t unknown
+count_status_tsv_jq='
   def is_up($s): ($s | ascii_upcase | test("AVAILABLE|UP"));
   def st($s):
     if $s == null or $s == "UNKNOWN" then "unknown"
     elif is_up($s) then "up"
     else "down" end;
 
-  .items // [] as $items
+  (.items // []) as $items
   | ($items | length) as $total
   | ($items | map(st($avail[.fullPath])) ) as $st
-  | {
-      total: $total,
-      up: ($st | map(select(.=="up")) | length),
-      down: ($st | map(select(.=="down")) | length),
-      unknown: ($st | map(select(.=="unknown")) | length)
-    }
+  | [
+      $total,
+      ($st | map(select(.=="up")) | length),
+      ($st | map(select(.=="down")) | length),
+      ($st | map(select(.=="unknown")) | length)
+    ] | @tsv
 '
 
 vs_csv_jq='
@@ -149,13 +150,11 @@ while IFS= read -r LINE || [[ -n "$LINE" ]]; do
   VS_CFG=$(curl "${AUTH[@]}" "https://${HOST}/mgmt/tm/ltm/virtual?\$select=fullPath,enabled,disabled,destination,ipProtocol&\$top=${TOP}")
   VS_STATS=$(curl "${AUTH[@]}" "https://${HOST}/mgmt/tm/ltm/virtual/stats?\$top=${TOP}" || echo '{}')
   VS_AVAIL=$(jq -c "$stats_to_avail_map_jq" <<<"$VS_STATS" 2>/dev/null || echo '{}')
+
   jq --argjson avail "$VS_AVAIL" -r "$vs_csv_jq" <<<"$VS_CFG" > "${HOST_DIR}/vs_inventory.csv"
 
-  VS_COUNT_OBJ=$(jq --argjson avail "$VS_AVAIL" -c "$count_status_obj_jq" <<<"$VS_CFG" 2>/dev/null || echo '{"total":0,"up":0,"down":0,"unknown":0}')
-  VS_TOTAL=$(jq -r '.total'   <<<"$VS_COUNT_OBJ")
-  VS_UP=$(jq -r '.up'         <<<"$VS_COUNT_OBJ")
-  VS_DOWN=$(jq -r '.down'     <<<"$VS_COUNT_OBJ")
-  VS_UNK=$(jq -r '.unknown'   <<<"$VS_COUNT_OBJ")
+  VS_COUNTS=$(jq --argjson avail "$VS_AVAIL" -r "$count_status_tsv_jq" <<<"$VS_CFG" 2>/dev/null || echo $'0\t0\t0\t0')
+  IFS=$'\t' read -r VS_TOTAL VS_UP VS_DOWN VS_UNK <<<"$VS_COUNTS"
 
   ###################################
   # POOLS
@@ -164,13 +163,11 @@ while IFS= read -r LINE || [[ -n "$LINE" ]]; do
   POOL_CFG=$(curl "${AUTH[@]}" "https://${HOST}/mgmt/tm/ltm/pool?\$select=fullPath,members,loadBalancingMode&\$top=${TOP}")
   POOL_STATS=$(curl "${AUTH[@]}" "https://${HOST}/mgmt/tm/ltm/pool/stats?\$top=${TOP}" || echo '{}')
   POOL_AVAIL=$(jq -c "$stats_to_avail_map_jq" <<<"$POOL_STATS" 2>/dev/null || echo '{}')
+
   jq --argjson avail "$POOL_AVAIL" -r "$pools_csv_jq" <<<"$POOL_CFG" > "${HOST_DIR}/pools_inventory.csv"
 
-  POOL_COUNT_OBJ=$(jq --argjson avail "$POOL_AVAIL" -c "$count_status_obj_jq" <<<"$POOL_CFG" 2>/dev/null || echo '{"total":0,"up":0,"down":0,"unknown":0}')
-  POOL_TOTAL=$(jq -r '.total'   <<<"$POOL_COUNT_OBJ")
-  POOL_UP=$(jq -r '.up'         <<<"$POOL_COUNT_OBJ")
-  POOL_DOWN=$(jq -r '.down'     <<<"$POOL_COUNT_OBJ")
-  POOL_UNK=$(jq -r '.unknown'   <<<"$POOL_COUNT_OBJ")
+  POOL_COUNTS=$(jq --argjson avail "$POOL_AVAIL" -r "$count_status_tsv_jq" <<<"$POOL_CFG" 2>/dev/null || echo $'0\t0\t0\t0')
+  IFS=$'\t' read -r POOL_TOTAL POOL_UP POOL_DOWN POOL_UNK <<<"$POOL_COUNTS"
 
   ###################################
   # NODES
@@ -179,13 +176,11 @@ while IFS= read -r LINE || [[ -n "$LINE" ]]; do
   NODE_CFG=$(curl "${AUTH[@]}" "https://${HOST}/mgmt/tm/ltm/node?\$select=fullPath,address&\$top=${TOP}")
   NODE_STATS=$(curl "${AUTH[@]}" "https://${HOST}/mgmt/tm/ltm/node/stats?\$top=${TOP}" || echo '{}')
   NODE_AVAIL=$(jq -c "$stats_to_avail_map_jq" <<<"$NODE_STATS" 2>/dev/null || echo '{}')
+
   jq --argjson avail "$NODE_AVAIL" -r "$nodes_csv_jq" <<<"$NODE_CFG" > "${HOST_DIR}/nodes_inventory.csv"
 
-  NODE_COUNT_OBJ=$(jq --argjson avail "$NODE_AVAIL" -c "$count_status_obj_jq" <<<"$NODE_CFG" 2>/dev/null || echo '{"total":0,"up":0,"down":0,"unknown":0}')
-  NODE_TOTAL=$(jq -r '.total'   <<<"$NODE_COUNT_OBJ")
-  NODE_UP=$(jq -r '.up'         <<<"$NODE_COUNT_OBJ")
-  NODE_DOWN=$(jq -r '.down'     <<<"$NODE_COUNT_OBJ")
-  NODE_UNK=$(jq -r '.unknown'   <<<"$NODE_COUNT_OBJ")
+  NODE_COUNTS=$(jq --argjson avail "$NODE_AVAIL" -r "$count_status_tsv_jq" <<<"$NODE_CFG" 2>/dev/null || echo $'0\t0\t0\t0')
+  IFS=$'\t' read -r NODE_TOTAL NODE_UP NODE_DOWN NODE_UNK <<<"$NODE_COUNTS"
 
   ###################################
   # ASM POLICIES
