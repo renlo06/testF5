@@ -9,9 +9,9 @@ LOCAL_BACKUP_DIR="/backups/f5"
 REMOTE_UCS_DIR="/var/local/ucs"
 
 MAX_PARALLEL=4
-JOB_DELAY=0.5   # 500 ms entre chaque job
+JOB_DELAY=0.5
 UCS_POLL_SLEEP=2
-UCS_TIMEOUT_SEC=3600   # 1h (ajuste si besoin)
+UCS_TIMEOUT_SEC=3600
 
 #######################################
 # PRECHECKS
@@ -37,17 +37,11 @@ DATE=$(date +%Y%m%d-%H%M%S)
 LOG_DIR="${LOCAL_BACKUP_DIR}/logs/${DATE}"
 mkdir -p "$LOG_DIR"
 
-# Arrays for tracking
-declare -A JOB_PID_BY_HOST
-declare -A JOB_STATUS_BY_HOST   # OK/KO
-declare -A JOB_MSG_BY_HOST
-
 #######################################
 # FUNCTIONS
 #######################################
 ssh_run() {
   local HOST="$1"; shift
-  # -n : stdin -> /dev/null ; important for robustness
   sshpass -p "$SSH_PASS" ssh -n \
     -o StrictHostKeyChecking=no \
     -o ConnectTimeout=15 \
@@ -56,66 +50,47 @@ ssh_run() {
 }
 
 scp_get() {
-  local HOST="$1"; local SRC="$2"; local DEST_DIR="$3"
+  local HOST="$1" SRC="$2" DEST="$3"
   sshpass -p "$SSH_PASS" scp -q \
     -o StrictHostKeyChecking=no \
     -o ConnectTimeout=30 \
-    "${SSH_USER}@${HOST}:${SRC}" \
-    "${DEST_DIR}/"
+    "$SSH_USER@$HOST:$SRC" "$DEST/"
 }
 
 create_ucs() {
-  local HOST="$1"; local UCS_NAME="$2"
-  ssh_run "$HOST" "tmsh save sys ucs $UCS_NAME"
+  ssh_run "$1" "tmsh save sys ucs $2"
 }
 
 wait_for_ucs() {
-  local HOST="$1"; local UCS_NAME="$2"
-  local start_ts now_ts
+  local HOST="$1" UCS_NAME="$2"
+  local start now
+  start=$(date +%s)
 
-  start_ts=$(date +%s)
   while true; do
-    if ssh_run "$HOST" "bash -lc 'test -f ${REMOTE_UCS_DIR}/${UCS_NAME}'"; then
+    if ssh_run "$HOST" "test -f ${REMOTE_UCS_DIR}/${UCS_NAME}"; then
       return 0
     fi
-
-    now_ts=$(date +%s)
-    if (( now_ts - start_ts > UCS_TIMEOUT_SEC )); then
-      return 1
-    fi
-
+    now=$(date +%s)
+    (( now - start > UCS_TIMEOUT_SEC )) && return 1
     sleep "$UCS_POLL_SLEEP"
   done
 }
 
 backup_host() {
-  local HOST="$1"
-  local DATE="$2"
-
+  local HOST="$1" DATE="$2"
   local UCS_NAME="${HOST}_${DATE}.ucs"
   local HOST_DIR="${LOCAL_BACKUP_DIR}/${HOST}"
-  local HOST_LOG="${LOG_DIR}/${HOST}.log"
+  local LOG="${LOG_DIR}/${HOST}.log"
 
   mkdir -p "$HOST_DIR"
 
   {
-    echo "======================================"
     echo "➡️  [$HOST] Démarrage sauvegarde"
-    echo "UCS : $UCS_NAME"
-    echo "======================================"
-
-    echo "📦 [$HOST] Création UCS"
     create_ucs "$HOST" "$UCS_NAME"
-
-    echo "⏳ [$HOST] Attente génération UCS (timeout ${UCS_TIMEOUT_SEC}s)"
     wait_for_ucs "$HOST" "$UCS_NAME"
-
-    echo "⬇️  [$HOST] Récupération UCS"
     scp_get "$HOST" "${REMOTE_UCS_DIR}/${UCS_NAME}" "$HOST_DIR"
-
-    echo "✅ [$HOST] UCS récupéré : $HOST_DIR/$UCS_NAME"
-    echo
-  } >"$HOST_LOG" 2>&1
+    echo "✅ [$HOST] UCS récupéré"
+  } >"$LOG" 2>&1
 }
 
 #######################################
@@ -123,68 +98,29 @@ backup_host() {
 #######################################
 echo
 echo "📦 Sauvegarde UCS BIG-IP"
-echo "Date            : $DATE"
-echo "Parallélisme    : $MAX_PARALLEL équipements"
-echo "Délai lancement : ${JOB_DELAY}s"
-echo "Logs            : $LOG_DIR"
+echo "Date         : $DATE"
+echo "Parallélisme : $MAX_PARALLEL"
+echo "Logs         : $LOG_DIR"
 echo
-
-JOB_COUNT=0
 
 while IFS= read -r LINE || [[ -n "$LINE" ]]; do
   HOST=$(echo "$LINE" | tr -d '\r' | xargs)
   [[ -z "$HOST" || "$HOST" =~ ^# ]] && continue
 
-  # Launch job
   backup_host "$HOST" "$DATE" &
-  pid=$!
-  JOB_PID_BY_HOST["$HOST"]=$pid
-  JOB_STATUS_BY_HOST["$HOST"]="RUNNING"
-  JOB_COUNT=$((JOB_COUNT + 1))
-
-  # Pause 500 ms
   sleep "$JOB_DELAY"
 
-  # Keep at most MAX_PARALLEL jobs
-  if (( JOB_COUNT >= MAX_PARALLEL )); then
-    # wait -n returns exit status of finished job; must not kill script under set -e
-    if ! wait -n; then
-      :  # swallow error here; we'll mark host status below via per-host waits
-    fi
-    JOB_COUNT=$((JOB_COUNT - 1))
-  fi
+  # --- LIMITE DE PARALLÉLISME (portable) ---
+  while (( $(jobs -p | wc -l) >= MAX_PARALLEL )); do
+    sleep 1
+  done
+
 done < "$DEVICES_FILE"
 
-# Wait for all remaining jobs and mark status by host
-FAILS=0
-for HOST in "${!JOB_PID_BY_HOST[@]}"; do
-  pid="${JOB_PID_BY_HOST[$HOST]}"
-  if wait "$pid"; then
-    JOB_STATUS_BY_HOST["$HOST"]="OK"
-  else
-    JOB_STATUS_BY_HOST["$HOST"]="KO"
-    JOB_MSG_BY_HOST["$HOST"]="Voir log: ${LOG_DIR}/${HOST}.log"
-    FAILS=$((FAILS + 1))
-  fi
-done
+# Attendre tous les jobs restants
+wait
 
 echo "======================================"
-echo "🏁 Résumé"
-for HOST in "${!JOB_PID_BY_HOST[@]}"; do
-  status="${JOB_STATUS_BY_HOST[$HOST]}"
-  if [[ "$status" == "OK" ]]; then
-    echo "✅ $HOST"
-  else
-    echo "❌ $HOST — ${JOB_MSG_BY_HOST[$HOST]}"
-  fi
-done
+echo "🎯 Sauvegarde UCS terminée"
 echo "Logs : $LOG_DIR"
 echo "======================================"
-
-# Return non-zero if any failure (useful for CI), but don't stop mid-run
-if (( FAILS > 0 )); then
-  echo "🎯 Terminé avec $FAILS échec(s)."
-  exit 1
-fi
-
-echo "🎯 Sauvegarde UCS terminée pour tous les équipements"
