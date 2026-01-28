@@ -8,6 +8,9 @@ DEVICES_FILE="devices.txt"
 LOCAL_BACKUP_DIR="/backups/f5"
 REMOTE_UCS_DIR="/var/local/ucs"
 
+BACKUP_DIR="${LOCAL_BACKUP_DIR}/backup"
+LOG_DIR="${LOCAL_BACKUP_DIR}/logs"
+
 MAX_PARALLEL=4
 JOB_DELAY=0.5
 UCS_POLL_SLEEP=2
@@ -17,12 +20,13 @@ STATUS_REFRESH_SEC=2
 #######################################
 # PRECHECKS
 #######################################
-for bin in ssh scp sshpass date; do
+for bin in ssh scp sshpass; do
   command -v "$bin" >/dev/null || { echo "❌ $bin requis"; exit 1; }
 done
 
 [[ -f "$DEVICES_FILE" ]] || { echo "❌ Fichier équipements introuvable : $DEVICES_FILE"; exit 1; }
-mkdir -p "$LOCAL_BACKUP_DIR"
+
+mkdir -p "$BACKUP_DIR" "$LOG_DIR"
 
 #######################################
 # INPUTS
@@ -30,16 +34,6 @@ mkdir -p "$LOCAL_BACKUP_DIR"
 read -p "Utilisateur SSH (root recommandé): " SSH_USER
 read -s -p "Mot de passe SSH: " SSH_PASS
 echo
-
-#######################################
-# RUNTIME (répertoire unique pour tous les UCS)
-#######################################
-DATE=$(date +%Y%m%d-%H%M%S)
-
-BACKUP_DIR="${LOCAL_BACKUP_DIR}/${DATE}"
-LOG_DIR="${LOCAL_BACKUP_DIR}/logs/${DATE}"
-
-mkdir -p "$BACKUP_DIR" "$LOG_DIR"
 
 #######################################
 # FUNCTIONS
@@ -64,7 +58,7 @@ scp_get() {
 
 create_ucs() {
   local HOST="$1" UCS_NAME="$2"
-  ssh_run "$HOST" "tmsh save sys ucs $UCS_NAME"
+  ssh_run "$HOST" "bash -lc 'tmsh save sys ucs \"${UCS_NAME}\"'"
 }
 
 wait_for_ucs() {
@@ -73,8 +67,7 @@ wait_for_ucs() {
   start=$(date +%s)
 
   while true; do
-    # force bash shell on BIG-IP (avoid tmsh parsing "test")
-    if ssh_run "$HOST" "bash -lc 'test -f ${REMOTE_UCS_DIR}/${UCS_NAME}'"; then
+    if ssh_run "$HOST" "bash -lc 'test -f \"${REMOTE_UCS_DIR}/${UCS_NAME}\"'"; then
       return 0
     fi
 
@@ -85,10 +78,11 @@ wait_for_ucs() {
 }
 
 backup_host() {
-  local HOST="$1" DATE="$2"
+  local HOST="$1"
 
-  local UCS_NAME="${HOST}_${DATE}.ucs"
-  local DEST_DIR="$BACKUP_DIR"
+  # ✅ Pas de date dans le nom
+  local UCS_NAME="${HOST}.ucs"
+
   local LOG="${LOG_DIR}/${HOST}.log"
   local STATUS_FILE="${LOG_DIR}/${HOST}.status"
 
@@ -96,9 +90,9 @@ backup_host() {
 
   {
     echo "======================================"
-    echo "➡️  [$HOST] Démarrage sauvegarde"
+    echo "➡️  [$HOST] Sauvegarde UCS"
     echo "UCS : $UCS_NAME"
-    echo "Dest: $DEST_DIR"
+    echo "Dest: $BACKUP_DIR"
     echo "======================================"
 
     echo "📦 [$HOST] Création UCS"
@@ -110,10 +104,10 @@ backup_host() {
 
     echo "RUNNING: scp" > "$STATUS_FILE"
     echo "⬇️  [$HOST] Transfert UCS"
-    scp_get "$HOST" "${REMOTE_UCS_DIR}/${UCS_NAME}" "$DEST_DIR"
+    scp_get "$HOST" "${REMOTE_UCS_DIR}/${UCS_NAME}" "$BACKUP_DIR"
 
     echo "OK" > "$STATUS_FILE"
-    echo "✅ [$HOST] UCS récupéré : $DEST_DIR/$UCS_NAME"
+    echo "✅ [$HOST] UCS récupéré : $BACKUP_DIR/$UCS_NAME"
     echo
   } >"$LOG" 2>&1 || {
     echo "KO" > "$STATUS_FILE"
@@ -125,9 +119,8 @@ print_status() {
   clear
   echo "======================================"
   echo "📦 Sauvegarde UCS BIG-IP – état en cours"
-  echo "Date         : $DATE"
-  echo "UCS ->       : $BACKUP_DIR"
-  echo "Logs ->      : $LOG_DIR"
+  echo "UCS ->  $BACKUP_DIR"
+  echo "Logs -> $LOG_DIR"
   echo "======================================"
   echo
 
@@ -150,11 +143,9 @@ print_status() {
 #######################################
 echo
 echo "📦 Sauvegarde UCS BIG-IP"
-echo "Date          : $DATE"
-echo "Parallélisme  : $MAX_PARALLEL équipements"
-echo "Délai job     : ${JOB_DELAY}s"
-echo "UCS ->        : $BACKUP_DIR"
-echo "Logs ->       : $LOG_DIR"
+echo "Parallélisme : $MAX_PARALLEL"
+echo "UCS ->       : $BACKUP_DIR"
+echo "Logs ->      : $LOG_DIR"
 echo
 
 # Watcher (dashboard)
@@ -177,7 +168,7 @@ while IFS= read -r LINE || [[ -n "$LINE" ]]; do
   HOST=$(echo "$LINE" | tr -d '\r' | xargs)
   [[ -z "$HOST" || "$HOST" =~ ^# ]] && continue
 
-  backup_host "$HOST" "$DATE" &
+  backup_host "$HOST" &
   sleep "$JOB_DELAY"
 
   # Throttle portable (pas de wait -n)
@@ -186,10 +177,7 @@ while IFS= read -r LINE || [[ -n "$LINE" ]]; do
   done
 done < "$DEVICES_FILE"
 
-# Attendre tous les jobs
 wait
-
-# Dernier affichage (final)
 print_status
 
 echo "======================================"
