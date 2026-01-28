@@ -54,11 +54,13 @@ scp_get() {
   sshpass -p "$SSH_PASS" scp -q \
     -o StrictHostKeyChecking=no \
     -o ConnectTimeout=30 \
-    "$SSH_USER@$HOST:$SRC" "$DEST/"
+    "$SSH_USER@$HOST:$SRC" \
+    "$DEST/"
 }
 
 create_ucs() {
-  ssh_run "$1" "tmsh save sys ucs $2"
+  local HOST="$1" UCS_NAME="$2"
+  ssh_run "$HOST" "tmsh save sys ucs $UCS_NAME"
 }
 
 wait_for_ucs() {
@@ -67,11 +69,16 @@ wait_for_ucs() {
   start=$(date +%s)
 
   while true; do
-    if ssh_run "$HOST" "test -f ${REMOTE_UCS_DIR}/${UCS_NAME}"; then
+    # ✅ IMPORTANT: forcer un shell bash côté BIG-IP
+    if ssh_run "$HOST" "bash -lc 'test -f ${REMOTE_UCS_DIR}/${UCS_NAME}'"; then
       return 0
     fi
+
     now=$(date +%s)
-    (( now - start > UCS_TIMEOUT_SEC )) && return 1
+    if (( now - start > UCS_TIMEOUT_SEC )); then
+      return 1
+    fi
+
     sleep "$UCS_POLL_SLEEP"
   done
 }
@@ -85,11 +92,22 @@ backup_host() {
   mkdir -p "$HOST_DIR"
 
   {
+    echo "======================================"
     echo "➡️  [$HOST] Démarrage sauvegarde"
+    echo "UCS : $UCS_NAME"
+    echo "======================================"
+
+    echo "📦 [$HOST] Création UCS"
     create_ucs "$HOST" "$UCS_NAME"
+
+    echo "⏳ [$HOST] Attente génération UCS (timeout ${UCS_TIMEOUT_SEC}s)"
     wait_for_ucs "$HOST" "$UCS_NAME"
+
+    echo "⬇️  [$HOST] Récupération UCS"
     scp_get "$HOST" "${REMOTE_UCS_DIR}/${UCS_NAME}" "$HOST_DIR"
-    echo "✅ [$HOST] UCS récupéré"
+
+    echo "✅ [$HOST] UCS récupéré : $HOST_DIR/$UCS_NAME"
+    echo
   } >"$LOG" 2>&1
 }
 
@@ -100,6 +118,7 @@ echo
 echo "📦 Sauvegarde UCS BIG-IP"
 echo "Date         : $DATE"
 echo "Parallélisme : $MAX_PARALLEL"
+echo "Délai job    : ${JOB_DELAY}s"
 echo "Logs         : $LOG_DIR"
 echo
 
@@ -110,14 +129,14 @@ while IFS= read -r LINE || [[ -n "$LINE" ]]; do
   backup_host "$HOST" "$DATE" &
   sleep "$JOB_DELAY"
 
-  # --- LIMITE DE PARALLÉLISME (portable) ---
+  # Throttle: max MAX_PARALLEL jobs en même temps (portable, sans wait -n)
   while (( $(jobs -p | wc -l) >= MAX_PARALLEL )); do
     sleep 1
   done
 
 done < "$DEVICES_FILE"
 
-# Attendre tous les jobs restants
+# ✅ Attendre tous les jobs
 wait
 
 echo "======================================"
