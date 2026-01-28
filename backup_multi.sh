@@ -20,12 +20,11 @@ STATUS_REFRESH_SEC=2
 #######################################
 # PRECHECKS
 #######################################
-for bin in ssh scp sshpass; do
+for bin in ssh scp sshpass date; do
   command -v "$bin" >/dev/null || { echo "❌ $bin requis"; exit 1; }
 done
 
 [[ -f "$DEVICES_FILE" ]] || { echo "❌ Fichier équipements introuvable : $DEVICES_FILE"; exit 1; }
-
 mkdir -p "$BACKUP_DIR" "$LOG_DIR"
 
 #######################################
@@ -58,6 +57,7 @@ scp_get() {
 
 create_ucs() {
   local HOST="$1" UCS_NAME="$2"
+  # uniformisé bash -lc
   ssh_run "$HOST" "bash -lc 'tmsh save sys ucs \"${UCS_NAME}\"'"
 }
 
@@ -70,7 +70,6 @@ wait_for_ucs() {
     if ssh_run "$HOST" "bash -lc 'test -f \"${REMOTE_UCS_DIR}/${UCS_NAME}\"'"; then
       return 0
     fi
-
     now=$(date +%s)
     (( now - start > UCS_TIMEOUT_SEC )) && return 1
     sleep "$UCS_POLL_SLEEP"
@@ -80,26 +79,22 @@ wait_for_ucs() {
 backup_host() {
   local HOST="$1"
 
-  # ✅ Pas de date dans le nom
-  local UCS_NAME="${HOST}.ucs"
-
+  local UCS_NAME="${HOST}.ucs"               # ✅ pas de date
   local LOG="${LOG_DIR}/${HOST}.log"
   local STATUS_FILE="${LOG_DIR}/${HOST}.status"
 
   echo "RUNNING: create_ucs" > "$STATUS_FILE"
 
   {
-    echo "======================================"
     echo "➡️  [$HOST] Sauvegarde UCS"
     echo "UCS : $UCS_NAME"
     echo "Dest: $BACKUP_DIR"
-    echo "======================================"
 
     echo "📦 [$HOST] Création UCS"
     create_ucs "$HOST" "$UCS_NAME"
 
     echo "RUNNING: wait_for_ucs" > "$STATUS_FILE"
-    echo "⏳ [$HOST] Attente génération UCS (timeout ${UCS_TIMEOUT_SEC}s)"
+    echo "⏳ [$HOST] Attente génération UCS"
     wait_for_ucs "$HOST" "$UCS_NAME"
 
     echo "RUNNING: scp" > "$STATUS_FILE"
@@ -108,7 +103,6 @@ backup_host() {
 
     echo "OK" > "$STATUS_FILE"
     echo "✅ [$HOST] UCS récupéré : $BACKUP_DIR/$UCS_NAME"
-    echo
   } >"$LOG" 2>&1 || {
     echo "KO" > "$STATUS_FILE"
     exit 1
@@ -119,7 +113,7 @@ print_status() {
   clear
   echo "======================================"
   echo "📦 Sauvegarde UCS BIG-IP – état en cours"
-  echo "UCS ->  $BACKUP_DIR"
+  echo "UCS  -> $BACKUP_DIR"
   echo "Logs -> $LOG_DIR"
   echo "======================================"
   echo
@@ -136,6 +130,18 @@ print_status() {
 
   echo
   echo "Actualisation toutes les ${STATUS_REFRESH_SEC}s"
+}
+
+# Compte le nombre de jobs (PIDs) encore en cours
+count_running_pids() {
+  local -n _pids=$1
+  local c=0
+  for pid in "${_pids[@]}"; do
+    if kill -0 "$pid" 2>/dev/null; then
+      c=$((c+1))
+    fi
+  done
+  echo "$c"
 }
 
 #######################################
@@ -164,24 +170,41 @@ cleanup() {
 }
 trap cleanup EXIT
 
+# On stocke les PIDs des backups (uniquement)
+PIDS=()
+
 while IFS= read -r LINE || [[ -n "$LINE" ]]; do
   HOST=$(echo "$LINE" | tr -d '\r' | xargs)
   [[ -z "$HOST" || "$HOST" =~ ^# ]] && continue
 
-  backup_host "$HOST" &
-  sleep "$JOB_DELAY"
-
-  # Throttle portable (pas de wait -n)
-  while (( $(jobs -p | wc -l) >= MAX_PARALLEL )); do
+  # Throttle: attendre tant qu'on a MAX_PARALLEL backups actifs
+  while [[ "$(count_running_pids PIDS)" -ge "$MAX_PARALLEL" ]]; do
     sleep 1
   done
+
+  backup_host "$HOST" &
+  PIDS+=("$!")
+  sleep "$JOB_DELAY"
 done < "$DEVICES_FILE"
 
-wait
+# Attendre UNIQUEMENT les backups (pas le watcher)
+FAILS=0
+for pid in "${PIDS[@]}"; do
+  if ! wait "$pid"; then
+    FAILS=$((FAILS+1))
+  fi
+done
+
+# Stop watcher et affichage final
+kill "$WATCHER_PID" >/dev/null 2>&1 || true
 print_status
 
 echo "======================================"
 echo "🎯 Sauvegarde UCS terminée"
 echo "UCS  : $BACKUP_DIR"
 echo "Logs : $LOG_DIR"
+echo "Échecs : $FAILS"
 echo "======================================"
+
+# option : code retour non nul si erreurs
+(( FAILS == 0 )) || exit 1
