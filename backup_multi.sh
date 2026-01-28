@@ -32,11 +32,14 @@ read -s -p "Mot de passe SSH: " SSH_PASS
 echo
 
 #######################################
-# RUNTIME
+# RUNTIME (répertoire unique pour tous les UCS)
 #######################################
 DATE=$(date +%Y%m%d-%H%M%S)
+
+BACKUP_DIR="${LOCAL_BACKUP_DIR}/${DATE}"
 LOG_DIR="${LOCAL_BACKUP_DIR}/logs/${DATE}"
-mkdir -p "$LOG_DIR"
+
+mkdir -p "$BACKUP_DIR" "$LOG_DIR"
 
 #######################################
 # FUNCTIONS
@@ -70,9 +73,11 @@ wait_for_ucs() {
   start=$(date +%s)
 
   while true; do
+    # force bash shell on BIG-IP (avoid tmsh parsing "test")
     if ssh_run "$HOST" "bash -lc 'test -f ${REMOTE_UCS_DIR}/${UCS_NAME}'"; then
       return 0
     fi
+
     now=$(date +%s)
     (( now - start > UCS_TIMEOUT_SEC )) && return 1
     sleep "$UCS_POLL_SLEEP"
@@ -81,29 +86,35 @@ wait_for_ucs() {
 
 backup_host() {
   local HOST="$1" DATE="$2"
+
   local UCS_NAME="${HOST}_${DATE}.ucs"
-  local HOST_DIR="${LOCAL_BACKUP_DIR}/${HOST}"
+  local DEST_DIR="$BACKUP_DIR"
   local LOG="${LOG_DIR}/${HOST}.log"
   local STATUS_FILE="${LOG_DIR}/${HOST}.status"
 
-  mkdir -p "$HOST_DIR"
   echo "RUNNING: create_ucs" > "$STATUS_FILE"
 
   {
-    echo "➡️  [$HOST] UCS : $UCS_NAME"
+    echo "======================================"
+    echo "➡️  [$HOST] Démarrage sauvegarde"
+    echo "UCS : $UCS_NAME"
+    echo "Dest: $DEST_DIR"
+    echo "======================================"
+
     echo "📦 [$HOST] Création UCS"
     create_ucs "$HOST" "$UCS_NAME"
 
     echo "RUNNING: wait_for_ucs" > "$STATUS_FILE"
-    echo "⏳ [$HOST] Attente génération UCS"
+    echo "⏳ [$HOST] Attente génération UCS (timeout ${UCS_TIMEOUT_SEC}s)"
     wait_for_ucs "$HOST" "$UCS_NAME"
 
     echo "RUNNING: scp" > "$STATUS_FILE"
     echo "⬇️  [$HOST] Transfert UCS"
-    scp_get "$HOST" "${REMOTE_UCS_DIR}/${UCS_NAME}" "$HOST_DIR"
+    scp_get "$HOST" "${REMOTE_UCS_DIR}/${UCS_NAME}" "$DEST_DIR"
 
     echo "OK" > "$STATUS_FILE"
-    echo "✅ [$HOST] UCS récupéré : $HOST_DIR/$UCS_NAME"
+    echo "✅ [$HOST] UCS récupéré : $DEST_DIR/$UCS_NAME"
+    echo
   } >"$LOG" 2>&1 || {
     echo "KO" > "$STATUS_FILE"
     exit 1
@@ -127,12 +138,14 @@ print_status() {
 #######################################
 echo
 echo "📦 Sauvegarde UCS BIG-IP"
-echo "Date         : $DATE"
-echo "Parallélisme : $MAX_PARALLEL"
-echo "Logs         : $LOG_DIR"
+echo "Date          : $DATE"
+echo "Parallélisme  : $MAX_PARALLEL équipements"
+echo "Délai job     : ${JOB_DELAY}s"
+echo "UCS ->        : $BACKUP_DIR"
+echo "Logs ->       : $LOG_DIR"
 echo
 
-# lancer un watcher en arrière-plan qui affiche les hôtes en cours
+# Watcher (affichage périodique des hosts en cours)
 WATCHER_PID=""
 watcher() {
   while true; do
@@ -143,7 +156,6 @@ watcher() {
 watcher &
 WATCHER_PID=$!
 
-# Arrêt propre du watcher à la fin
 cleanup() {
   [[ -n "${WATCHER_PID:-}" ]] && kill "$WATCHER_PID" >/dev/null 2>&1 || true
 }
@@ -156,17 +168,21 @@ while IFS= read -r LINE || [[ -n "$LINE" ]]; do
   backup_host "$HOST" "$DATE" &
   sleep "$JOB_DELAY"
 
+  # Throttle portable (pas de wait -n)
   while (( $(jobs -p | wc -l) >= MAX_PARALLEL )); do
     sleep 1
   done
+
 done < "$DEVICES_FILE"
 
+# Attendre tous les jobs
 wait
 
-# Dernier affichage (final)
+# Dernier affichage
 print_status
 
 echo "======================================"
 echo "🎯 Sauvegarde UCS terminée"
+echo "UCS  : $BACKUP_DIR"
 echo "Logs : $LOG_DIR"
 echo "======================================"
