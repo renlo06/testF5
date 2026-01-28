@@ -122,15 +122,27 @@ backup_host() {
 }
 
 print_status() {
+  clear
+  echo "======================================"
+  echo "📦 Sauvegarde UCS BIG-IP – état en cours"
+  echo "Date         : $DATE"
+  echo "UCS ->       : $BACKUP_DIR"
+  echo "Logs ->      : $LOG_DIR"
+  echo "======================================"
   echo
-  echo "====== Équipements en cours ======"
+
+  printf "%-30s %s\n" "Équipement" "Statut"
+  printf "%-30s %s\n" "----------" "------"
+
   for f in "$LOG_DIR"/*.status; do
     [[ -e "$f" ]] || continue
     host=$(basename "$f" .status)
     state=$(cat "$f" 2>/dev/null || echo "UNKNOWN")
     printf "%-30s %s\n" "$host" "$state"
   done
-  echo "=================================="
+
+  echo
+  echo "Actualisation toutes les ${STATUS_REFRESH_SEC}s"
 }
 
 #######################################
@@ -145,7 +157,7 @@ echo "UCS ->        : $BACKUP_DIR"
 echo "Logs ->       : $LOG_DIR"
 echo
 
-# Watcher (affichage périodique des hosts en cours)
+# Watcher (dashboard)
 WATCHER_PID=""
 watcher() {
   while true; do
@@ -172,13 +184,12 @@ while IFS= read -r LINE || [[ -n "$LINE" ]]; do
   while (( $(jobs -p | wc -l) >= MAX_PARALLEL )); do
     sleep 1
   done
-
 done < "$DEVICES_FILE"
 
 # Attendre tous les jobs
 wait
 
-# Dernier affichage
+# Dernier affichage (final)
 print_status
 
 echo "======================================"
