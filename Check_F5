@@ -5,208 +5,213 @@ set -euo pipefail
 # CONFIG
 #######################################
 DEVICES_FILE="devices.txt"
-LOCAL_BACKUP_DIR="/backups/f5"
-REMOTE_UCS_DIR="/var/local/ucs"
-
-BACKUP_DIR="${LOCAL_BACKUP_DIR}/backup"   # ✅ tous les UCS ici
-LOG_DIR="${LOCAL_BACKUP_DIR}/logs"        # logs + status ici
-
-MAX_PARALLEL=4
-JOB_DELAY=0.5
-UCS_POLL_SLEEP=2
-UCS_TIMEOUT_SEC=3600
-STATUS_REFRESH_SEC=2
+OUT_BASE="./inventory"
+TS=$(date +%Y%m%d-%H%M%S)
+TOP=10000
 
 #######################################
 # PRECHECKS
 #######################################
-for bin in ssh scp sshpass date wc; do
+for bin in curl jq date; do
   command -v "$bin" >/dev/null || { echo "❌ $bin requis"; exit 1; }
 done
 
 [[ -f "$DEVICES_FILE" ]] || { echo "❌ Fichier équipements introuvable : $DEVICES_FILE"; exit 1; }
-mkdir -p "$BACKUP_DIR" "$LOG_DIR"
+mkdir -p "$OUT_BASE"
 
 #######################################
 # INPUTS
 #######################################
-read -p "Utilisateur SSH (root recommandé): " SSH_USER
-read -s -p "Mot de passe SSH: " SSH_PASS
+read -p "Utilisateur API (ex: admin): " API_USER
+read -s -p "Mot de passe API: " API_PASS
 echo
 
+AUTH=(-u "${API_USER}:${API_PASS}" -k -sS)
+
 #######################################
-# FUNCTIONS
+# GLOBAL SUMMARY OUTPUTS
 #######################################
-ssh_run() {
-  local HOST="$1"; shift
-  sshpass -p "$SSH_PASS" ssh -n \
-    -o StrictHostKeyChecking=no \
-    -o ConnectTimeout=15 \
-    -o LogLevel=Error \
-    "$SSH_USER@$HOST" "$@"
-}
+SUMMARY_CSV="${OUT_BASE}/summary_${TS}.csv"
+SUMMARY_TXT="${OUT_BASE}/summary_${TS}.txt"
 
-scp_get() {
-  local HOST="$1" SRC="$2" DEST="$3"
-  sshpass -p "$SSH_PASS" scp -q \
-    -o StrictHostKeyChecking=no \
-    -o ConnectTimeout=30 \
-    "$SSH_USER@$HOST:$SRC" \
-    "$DEST/"
-}
-
-create_ucs() {
-  local HOST="$1" UCS_NAME="$2"
-  ssh_run "$HOST" "bash -lc 'tmsh save sys ucs \"${UCS_NAME}\"'"
-}
-
-wait_for_ucs() {
-  local HOST="$1" UCS_NAME="$2"
-  local start now
-  start=$(date +%s)
-
-  while true; do
-    # ✅ force bash on BIG-IP (évite tmsh qui ne comprend pas "test")
-    if ssh_run "$HOST" "bash -lc 'test -f \"${REMOTE_UCS_DIR}/${UCS_NAME}\"'"; then
-      return 0
-    fi
-
-    now=$(date +%s)
-    if (( now - start > UCS_TIMEOUT_SEC )); then
-      return 1
-    fi
-
-    sleep "$UCS_POLL_SLEEP"
-  done
-}
-
-backup_host() {
-  local HOST="$1"
-
-  local UCS_NAME="${HOST}.ucs"              # ✅ pas de date
-  local LOG="${LOG_DIR}/${HOST}.log"
-  local STATUS_FILE="${LOG_DIR}/${HOST}.status"
-
-  echo "RUNNING: create_ucs" > "$STATUS_FILE"
-
-  {
-    echo "➡️  [$HOST] Sauvegarde UCS"
-    echo "UCS : $UCS_NAME"
-    echo "Dest: $BACKUP_DIR"
-
-    echo "📦 [$HOST] Création UCS"
-    create_ucs "$HOST" "$UCS_NAME"
-
-    echo "RUNNING: wait_for_ucs" > "$STATUS_FILE"
-    echo "⏳ [$HOST] Attente génération UCS (timeout ${UCS_TIMEOUT_SEC}s)"
-    wait_for_ucs "$HOST" "$UCS_NAME"
-
-    echo "RUNNING: scp" > "$STATUS_FILE"
-    echo "⬇️  [$HOST] Transfert UCS"
-    scp_get "$HOST" "${REMOTE_UCS_DIR}/${UCS_NAME}" "$BACKUP_DIR"
-
-    echo "OK" > "$STATUS_FILE"
-    echo "✅ [$HOST] UCS récupéré : $BACKUP_DIR/$UCS_NAME"
-  } >"$LOG" 2>&1 || {
-    echo "KO" > "$STATUS_FILE"
-    exit 1
-  }
-}
-
-print_status() {
-  clear
-  echo "======================================"
-  echo "📦 Sauvegarde UCS BIG-IP – état en cours"
-  echo "UCS  -> $BACKUP_DIR"
-  echo "Logs -> $LOG_DIR"
-  echo "======================================"
+echo 'host,vs_total,vs_up,vs_down,vs_unknown,pools_total,pools_up,pools_down,pools_unknown,nodes_total,nodes_up,nodes_down,nodes_unknown,asm_policies_total' > "$SUMMARY_CSV"
+{
+  echo "Run: $TS"
   echo
+} > "$SUMMARY_TXT"
 
-  printf "%-30s %s\n" "Équipement" "Statut"
-  printf "%-30s %s\n" "----------" "------"
+#######################################
+# JQ HELPERS
+#######################################
+stats_to_avail_map_jq='
+  def key_to_fullpath:
+    ( . | capture("~(?<p>[^~]+)~(?<n>[^/]+)")? )
+    | if . == null then null else ("/" + .p + "/" + .n) end;
 
-  for f in "$LOG_DIR"/*.status; do
-    [[ -e "$f" ]] || continue
-    host=$(basename "$f" .status)
-    state=$(cat "$f" 2>/dev/null || echo "UNKNOWN")
-    printf "%-30s %s\n" "$host" "$state"
-  done
+  def pick_avail($e):
+    (
+      $e.nestedStats.entries.availabilityState.description? //
+      $e.nestedStats.entries.status_availabilityState.description? //
+      $e.nestedStats.entries.status.description? //
+      $e.nestedStats.entries.availability.description? //
+      empty
+    );
 
-  echo
-  echo "Actualisation toutes les ${STATUS_REFRESH_SEC}s"
-}
+  reduce (.entries // {} | to_entries[]) as $it ({}; 
+    ($it.key | key_to_fullpath) as $fp
+    | if $fp == null then . else . + { ($fp): (pick_avail($it.value) // "UNKNOWN") } end
+  )
+'
 
-# ✅ Compte le nombre de PIDs encore actifs (portable, sans local -n)
-count_running_pids() {
-  local c=0 pid
-  for pid in "$@"; do
-    [[ -z "$pid" ]] && continue
-    if kill -0 "$pid" 2>/dev/null; then
-      c=$((c+1))
-    fi
-  done
-  echo "$c"
-}
+# => sort: total \t up \t down \t unknown
+count_status_tsv_jq='
+  def is_up($s): ($s | ascii_upcase | test("AVAILABLE|UP"));
+  def st($s):
+    if $s == null or $s == "UNKNOWN" then "unknown"
+    elif is_up($s) then "up"
+    else "down" end;
+
+  (.items // []) as $items
+  | ($items | length) as $total
+  | ($items | map(st($avail[.fullPath])) ) as $st
+  | [
+      $total,
+      ($st | map(select(.=="up")) | length),
+      ($st | map(select(.=="down")) | length),
+      ($st | map(select(.=="unknown")) | length)
+    ] | @tsv
+'
+
+vs_csv_jq='
+  (["fullPath","enabled","disabled","destination","ipProtocol","availability"] | @csv),
+  (.items[]? | [
+    .fullPath,
+    (.enabled // ""),
+    (.disabled // ""),
+    (.destination // ""),
+    (.ipProtocol // ""),
+    ($avail[.fullPath] // "UNKNOWN")
+  ] | @csv)
+'
+
+pools_csv_jq='
+  (["fullPath","members","loadBalancingMode","availability"] | @csv),
+  (.items[]? | [
+    .fullPath,
+    (.members // "" | tostring),
+    (.loadBalancingMode // ""),
+    ($avail[.fullPath] // "UNKNOWN")
+  ] | @csv)
+'
+
+nodes_csv_jq='
+  (["fullPath","address","availability"] | @csv),
+  (.items[]? | [
+    .fullPath,
+    (.address // ""),
+    ($avail[.fullPath] // "UNKNOWN")
+  ] | @csv)
+'
+
+asm_csv_jq='
+  (["name","id","fullPath"] | @csv),
+  (.items[]? | [
+    (.name // ""),
+    (.id // ""),
+    (.fullPath // "")
+  ] | @csv)
+'
 
 #######################################
 # MAIN
 #######################################
 echo
-echo "📦 Sauvegarde UCS BIG-IP"
-echo "Parallélisme : $MAX_PARALLEL"
-echo "UCS ->       : $BACKUP_DIR"
-echo "Logs ->      : $LOG_DIR"
+echo "📋 Inventaire BIG-IP (REST) — CSV + synthèse CSV/TXT"
+echo "📅 Horodatage : $TS"
+echo "📄 Synthèse CSV : $SUMMARY_CSV"
+echo "📝 Synthèse TXT : $SUMMARY_TXT"
 echo
-
-# Watcher (dashboard)
-WATCHER_PID=""
-watcher() {
-  while true; do
-    print_status
-    sleep "$STATUS_REFRESH_SEC"
-  done
-}
-watcher &
-WATCHER_PID=$!
-
-cleanup() {
-  [[ -n "${WATCHER_PID:-}" ]] && kill "$WATCHER_PID" >/dev/null 2>&1 || true
-}
-trap cleanup EXIT
-
-PIDS=()
 
 while IFS= read -r LINE || [[ -n "$LINE" ]]; do
   HOST=$(echo "$LINE" | tr -d '\r' | xargs)
   [[ -z "$HOST" || "$HOST" =~ ^# ]] && continue
 
-  # throttle: max MAX_PARALLEL jobs en cours
-  while [[ "$(count_running_pids "${PIDS[@]}")" -ge "$MAX_PARALLEL" ]]; do
-    sleep 1
-  done
+  HOST_DIR="${OUT_BASE}/${HOST}/${TS}"
+  mkdir -p "$HOST_DIR"
 
-  backup_host "$HOST" &
-  PIDS+=("$!")
-  sleep "$JOB_DELAY"
+  echo "======================================"
+  echo "➡️  BIG-IP : $HOST"
+  echo "======================================"
+
+  ###################################
+  # VS
+  ###################################
+  echo "🔎 VS"
+  VS_CFG=$(curl "${AUTH[@]}" "https://${HOST}/mgmt/tm/ltm/virtual?\$select=fullPath,enabled,disabled,destination,ipProtocol&\$top=${TOP}")
+  VS_STATS=$(curl "${AUTH[@]}" "https://${HOST}/mgmt/tm/ltm/virtual/stats?\$top=${TOP}" || echo '{}')
+  VS_AVAIL=$(jq -c "$stats_to_avail_map_jq" <<<"$VS_STATS" 2>/dev/null || echo '{}')
+
+  jq --argjson avail "$VS_AVAIL" -r "$vs_csv_jq" <<<"$VS_CFG" > "${HOST_DIR}/vs_inventory.csv"
+
+  VS_COUNTS=$(jq --argjson avail "$VS_AVAIL" -r "$count_status_tsv_jq" <<<"$VS_CFG" 2>/dev/null || echo $'0\t0\t0\t0')
+  IFS=$'\t' read -r VS_TOTAL VS_UP VS_DOWN VS_UNK <<<"$VS_COUNTS"
+
+  ###################################
+  # POOLS
+  ###################################
+  echo "🔎 Pools"
+  POOL_CFG=$(curl "${AUTH[@]}" "https://${HOST}/mgmt/tm/ltm/pool?\$select=fullPath,members,loadBalancingMode&\$top=${TOP}")
+  POOL_STATS=$(curl "${AUTH[@]}" "https://${HOST}/mgmt/tm/ltm/pool/stats?\$top=${TOP}" || echo '{}')
+  POOL_AVAIL=$(jq -c "$stats_to_avail_map_jq" <<<"$POOL_STATS" 2>/dev/null || echo '{}')
+
+  jq --argjson avail "$POOL_AVAIL" -r "$pools_csv_jq" <<<"$POOL_CFG" > "${HOST_DIR}/pools_inventory.csv"
+
+  POOL_COUNTS=$(jq --argjson avail "$POOL_AVAIL" -r "$count_status_tsv_jq" <<<"$POOL_CFG" 2>/dev/null || echo $'0\t0\t0\t0')
+  IFS=$'\t' read -r POOL_TOTAL POOL_UP POOL_DOWN POOL_UNK <<<"$POOL_COUNTS"
+
+  ###################################
+  # NODES
+  ###################################
+  echo "🔎 Nodes"
+  NODE_CFG=$(curl "${AUTH[@]}" "https://${HOST}/mgmt/tm/ltm/node?\$select=fullPath,address&\$top=${TOP}")
+  NODE_STATS=$(curl "${AUTH[@]}" "https://${HOST}/mgmt/tm/ltm/node/stats?\$top=${TOP}" || echo '{}')
+  NODE_AVAIL=$(jq -c "$stats_to_avail_map_jq" <<<"$NODE_STATS" 2>/dev/null || echo '{}')
+
+  jq --argjson avail "$NODE_AVAIL" -r "$nodes_csv_jq" <<<"$NODE_CFG" > "${HOST_DIR}/nodes_inventory.csv"
+
+  NODE_COUNTS=$(jq --argjson avail "$NODE_AVAIL" -r "$count_status_tsv_jq" <<<"$NODE_CFG" 2>/dev/null || echo $'0\t0\t0\t0')
+  IFS=$'\t' read -r NODE_TOTAL NODE_UP NODE_DOWN NODE_UNK <<<"$NODE_COUNTS"
+
+  ###################################
+  # ASM POLICIES
+  ###################################
+  echo "🔎 ASM Policies"
+  ASM_JSON=$(curl "${AUTH[@]}" "https://${HOST}/mgmt/tm/asm/policies?\$select=name,id,fullPath&\$top=${TOP}" || echo '{}')
+  jq -r "$asm_csv_jq" <<<"$ASM_JSON" > "${HOST_DIR}/asm_policies.csv"
+  ASM_TOTAL=$(jq -r '(.items // []) | length' <<<"$ASM_JSON")
+
+  ###################################
+  # SUMMARY CSV
+  ###################################
+  echo "${HOST},${VS_TOTAL},${VS_UP},${VS_DOWN},${VS_UNK},${POOL_TOTAL},${POOL_UP},${POOL_DOWN},${POOL_UNK},${NODE_TOTAL},${NODE_UP},${NODE_DOWN},${NODE_UNK},${ASM_TOTAL}" \
+    >> "$SUMMARY_CSV"
+
+  ###################################
+  # SUMMARY TXT (UP/DOWN/UNKNOWN)
+  ###################################
+  {
+    echo "Host: $HOST"
+    echo "  VS    : total=${VS_TOTAL}  up=${VS_UP}  down=${VS_DOWN}  unknown=${VS_UNK}"
+    echo "  Pools : total=${POOL_TOTAL}  up=${POOL_UP}  down=${POOL_DOWN}  unknown=${POOL_UNK}"
+    echo "  Nodes : total=${NODE_TOTAL}  up=${NODE_UP}  down=${NODE_DOWN}  unknown=${NODE_UNK}"
+    echo "  ASM Policies: total=${ASM_TOTAL}"
+    echo
+  } >> "$SUMMARY_TXT"
+
+  echo "✅ Export terminé pour $HOST"
+  echo
 done < "$DEVICES_FILE"
 
-# wait uniquement sur les backups
-FAILS=0
-for pid in "${PIDS[@]}"; do
-  if ! wait "$pid"; then
-    FAILS=$((FAILS+1))
-  fi
-done
-
-# arrêter le watcher + affichage final
-kill "$WATCHER_PID" >/dev/null 2>&1 || true
-print_status
-
-echo "======================================"
-echo "🎯 Sauvegarde UCS terminée"
-echo "UCS  : $BACKUP_DIR"
-echo "Logs : $LOG_DIR"
-echo "Échecs : $FAILS"
-echo "======================================"
-
-(( FAILS == 0 )) || exit 1
+echo "🏁 Terminé"
+echo "📄 Synthèse CSV : $SUMMARY_CSV"
+echo "📝 Synthèse TXT : $SUMMARY_TXT"
