@@ -8,8 +8,8 @@ DEVICES_FILE="devices.txt"
 LOCAL_BACKUP_DIR="/backups/f5"
 REMOTE_UCS_DIR="/var/local/ucs"
 
-BACKUP_DIR="${LOCAL_BACKUP_DIR}/backup"
-LOG_DIR="${LOCAL_BACKUP_DIR}/logs"
+BACKUP_DIR="${LOCAL_BACKUP_DIR}/backup"   # ✅ tous les UCS ici
+LOG_DIR="${LOCAL_BACKUP_DIR}/logs"        # logs + status ici
 
 MAX_PARALLEL=4
 JOB_DELAY=0.5
@@ -66,11 +66,16 @@ wait_for_ucs() {
   start=$(date +%s)
 
   while true; do
+    # ✅ force bash on BIG-IP (évite tmsh qui ne comprend pas "test")
     if ssh_run "$HOST" "bash -lc 'test -f \"${REMOTE_UCS_DIR}/${UCS_NAME}\"'"; then
       return 0
     fi
+
     now=$(date +%s)
-    (( now - start > UCS_TIMEOUT_SEC )) && return 1
+    if (( now - start > UCS_TIMEOUT_SEC )); then
+      return 1
+    fi
+
     sleep "$UCS_POLL_SLEEP"
   done
 }
@@ -78,7 +83,7 @@ wait_for_ucs() {
 backup_host() {
   local HOST="$1"
 
-  local UCS_NAME="${HOST}.ucs"
+  local UCS_NAME="${HOST}.ucs"              # ✅ pas de date
   local LOG="${LOG_DIR}/${HOST}.log"
   local STATUS_FILE="${LOG_DIR}/${HOST}.status"
 
@@ -93,7 +98,7 @@ backup_host() {
     create_ucs "$HOST" "$UCS_NAME"
 
     echo "RUNNING: wait_for_ucs" > "$STATUS_FILE"
-    echo "⏳ [$HOST] Attente génération UCS"
+    echo "⏳ [$HOST] Attente génération UCS (timeout ${UCS_TIMEOUT_SEC}s)"
     wait_for_ucs "$HOST" "$UCS_NAME"
 
     echo "RUNNING: scp" > "$STATUS_FILE"
@@ -131,7 +136,7 @@ print_status() {
   echo "Actualisation toutes les ${STATUS_REFRESH_SEC}s"
 }
 
-# Compte combien de PIDs (passés en args) sont encore vivants
+# ✅ Compte le nombre de PIDs encore actifs (portable, sans local -n)
 count_running_pids() {
   local c=0 pid
   for pid in "$@"; do
@@ -153,7 +158,7 @@ echo "UCS ->       : $BACKUP_DIR"
 echo "Logs ->      : $LOG_DIR"
 echo
 
-# Watcher
+# Watcher (dashboard)
 WATCHER_PID=""
 watcher() {
   while true; do
@@ -175,7 +180,7 @@ while IFS= read -r LINE || [[ -n "$LINE" ]]; do
   HOST=$(echo "$LINE" | tr -d '\r' | xargs)
   [[ -z "$HOST" || "$HOST" =~ ^# ]] && continue
 
-  # Throttle: attendre si on a déjà MAX_PARALLEL jobs en cours
+  # throttle: max MAX_PARALLEL jobs en cours
   while [[ "$(count_running_pids "${PIDS[@]}")" -ge "$MAX_PARALLEL" ]]; do
     sleep 1
   done
@@ -185,7 +190,7 @@ while IFS= read -r LINE || [[ -n "$LINE" ]]; do
   sleep "$JOB_DELAY"
 done < "$DEVICES_FILE"
 
-# Attendre uniquement les backups
+# wait uniquement sur les backups
 FAILS=0
 for pid in "${PIDS[@]}"; do
   if ! wait "$pid"; then
@@ -193,7 +198,7 @@ for pid in "${PIDS[@]}"; do
   fi
 done
 
-# Stop watcher + affichage final
+# arrêter le watcher + affichage final
 kill "$WATCHER_PID" >/dev/null 2>&1 || true
 print_status
 
