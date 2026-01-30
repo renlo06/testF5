@@ -14,6 +14,9 @@ UCS_POLL_SLEEP=2
 UCS_TIMEOUT_SEC=3600
 STATUS_REFRESH_SEC=2
 
+#######################################
+# PRECHECKS
+#######################################
 for bin in ssh scp sshpass date; do
   command -v "$bin" >/dev/null || { echo "❌ $bin requis"; exit 1; }
 done
@@ -21,9 +24,39 @@ done
 [[ -f "$DEVICES_FILE" ]] || { echo "❌ Fichier équipements introuvable : $DEVICES_FILE"; exit 1; }
 mkdir -p "$BACKUP_DIR" "$LOG_DIR"
 
+#######################################
+# INPUTS
+#######################################
 read -p "Utilisateur SSH (root recommandé): " SSH_USER
 read -s -p "Mot de passe SSH: " SSH_PASS
 echo
+
+#######################################
+# OPTION A: Nettoyage des anciens statuts
+#######################################
+rm -f "$LOG_DIR"/*.status 2>/dev/null || true
+
+#######################################
+# OPTION B: Construire la liste des hôtes du run
+#######################################
+HOSTS_RUN_FILE="$(mktemp)"
+while IFS= read -r LINE || [[ -n "$LINE" ]]; do
+  h=$(echo "$LINE" | tr -d '\r' | xargs)
+  [[ -z "$h" || "$h" =~ ^# ]] && continue
+  echo "$h"
+done < "$DEVICES_FILE" > "$HOSTS_RUN_FILE"
+
+#######################################
+# (Bonus) Nettoyage des logs des hôtes absents du run
+# (évite que des .log d’anciens hôtes s’accumulent)
+#######################################
+for old in "$LOG_DIR"/*.log; do
+  [[ -e "$old" ]] || continue
+  old_host=$(basename "$old" .log)
+  if ! grep -Fxq "$old_host" "$HOSTS_RUN_FILE"; then
+    rm -f "$old" 2>/dev/null || true
+  fi
+done
 
 ssh_run() {
   sshpass -p "$SSH_PASS" ssh -n \
@@ -86,10 +119,19 @@ print_status() {
   echo
   printf "%-30s %s\n" "Équipement" "Statut"
   printf "%-30s %s\n" "----------" "------"
-  for f in "$LOG_DIR"/*.status; do
-    [[ -e "$f" ]] || continue
-    printf "%-30s %s\n" "$(basename "$f" .status)" "$(cat "$f" 2>/dev/null || echo UNKNOWN)"
-  done
+
+  # OPTION B: afficher uniquement les hôtes du fichier devices.txt
+  while IFS= read -r host || [[ -n "$host" ]]; do
+    [[ -z "$host" ]] && continue
+    status_file="$LOG_DIR/${host}.status"
+    if [[ -f "$status_file" ]]; then
+      state=$(cat "$status_file" 2>/dev/null || echo "UNKNOWN")
+    else
+      state="PENDING"
+    fi
+    printf "%-30s %s\n" "$host" "$state"
+  done < "$HOSTS_RUN_FILE"
+
   echo
   echo "Actualisation toutes les ${STATUS_REFRESH_SEC}s"
 }
@@ -120,9 +162,14 @@ WATCHER_PID=""
 watcher() { while true; do print_status; sleep "$STATUS_REFRESH_SEC"; done; }
 watcher &
 WATCHER_PID=$!
-trap 'kill "$WATCHER_PID" 2>/dev/null || true' EXIT
 
-# ✅ Déclare explicitement le tableau
+cleanup() {
+  rm -f "$HOSTS_RUN_FILE" 2>/dev/null || true
+  kill "$WATCHER_PID" 2>/dev/null || true
+}
+trap cleanup EXIT
+
+# Déclare explicitement le tableau
 declare -a PIDS=()
 
 while IFS= read -r HOST || [[ -n "$HOST" ]]; do
