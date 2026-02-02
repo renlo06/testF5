@@ -1,0 +1,114 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+#######################################
+# CONFIG
+#######################################
+DEVICES_FILE="devices.txt"
+OUT_BASE="./checks"
+TS="$(date +%Y%m%d-%H%M%S)"
+
+# Par défaut: un dossier par run
+RUN_DIR="${OUT_BASE}/${TS}"
+ERR_LOG="${RUN_DIR}/errors.log"
+
+#######################################
+# PRECHECKS
+#######################################
+for bin in ssh sshpass date grep; do
+  command -v "$bin" >/dev/null || { echo "❌ $bin requis"; exit 1; }
+done
+
+[[ -f "$DEVICES_FILE" ]] || { echo "❌ Fichier équipements introuvable : $DEVICES_FILE"; exit 1; }
+mkdir -p "$RUN_DIR"
+
+#######################################
+# INPUTS
+#######################################
+read -p "Utilisateur SSH (ex: root/admin): " SSH_USER
+read -s -p "Mot de passe SSH: " SSH_PASS
+echo
+
+#######################################
+# SSH helper
+#######################################
+ssh_exec() {
+  local HOST="$1"
+  local CMD="$2"
+
+  # -n évite que ssh lise stdin (important dans une boucle while read)
+  sshpass -p "$SSH_PASS" ssh -n \
+    -o StrictHostKeyChecking=no \
+    -o ConnectTimeout=15 \
+    -o LogLevel=Error \
+    "${SSH_USER}@${HOST}" \
+    "bash -lc $'${CMD}'"
+}
+
+#######################################
+# COMMANDS (name -> tmsh + grep)
+# On garde tes grep exactement.
+#######################################
+run_checks_for_host() {
+  local HOST="$1"
+  local HOST_DIR="${RUN_DIR}/${HOST}"
+  mkdir -p "$HOST_DIR"
+
+  echo "➡️  $HOST"
+
+  # 1) ASM Policies
+  {
+    ssh_exec "$HOST" "tmsh -c \"cd /; list asm policy recursive\" | grep \"asm policy\""
+  } > "${HOST_DIR}/asm_policies.txt" 2>>"$ERR_LOG" || {
+    echo "[$HOST] ❌ ASM policies failed" >>"$ERR_LOG"
+  }
+
+  # 2) VS (typo fix: virtual)
+  {
+    ssh_exec "$HOST" "tmsh -c \"cd /; show ltm virtual recursive\" | grep \"LTM::Virtual\\\\|Availability\""
+  } > "${HOST_DIR}/virtual_servers.txt" 2>>"$ERR_LOG" || {
+    echo "[$HOST] ❌ VS failed" >>"$ERR_LOG"
+  }
+
+  # 3) Pools
+  {
+    ssh_exec "$HOST" "tmsh -c \"cd /; show ltm pool recursive members\" | grep \"LTM::Pool\\\\|Availability\""
+  } > "${HOST_DIR}/pools.txt" 2>>"$ERR_LOG" || {
+    echo "[$HOST] ❌ Pools failed" >>"$ERR_LOG"
+  }
+
+  # 4) Nodes
+  {
+    ssh_exec "$HOST" "tmsh -c \"cd /; show ltm node recursive\" | grep \"LTM::Node\\\\|Availability\""
+  } > "${HOST_DIR}/nodes.txt" 2>>"$ERR_LOG" || {
+    echo "[$HOST] ❌ Nodes failed" >>"$ERR_LOG"
+  }
+
+  echo "✅ $HOST terminé"
+  echo
+}
+
+#######################################
+# MAIN
+#######################################
+echo
+echo "📋 F5 Check (tmsh) – Run: $TS"
+echo "Sortie : $RUN_DIR"
+echo "Erreurs: $ERR_LOG"
+echo
+
+: > "$ERR_LOG"
+
+while IFS= read -r LINE || [[ -n "$LINE" ]]; do
+  HOST="$(echo "$LINE" | tr -d '\r' | xargs)"
+  [[ -z "$HOST" || "$HOST" =~ ^# ]] && continue
+  run_checks_for_host "$HOST"
+done < "$DEVICES_FILE"
+
+echo "🏁 Terminé"
+echo "📁 Résultats : $RUN_DIR"
+if [[ -s "$ERR_LOG" ]]; then
+  echo "⚠️  Des erreurs ont été détectées : $ERR_LOG"
+else
+  echo "✅ Aucun échec détecté"
+fi
