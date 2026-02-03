@@ -10,12 +10,6 @@ TS="$(date +%Y%m%d-%H%M%S)"
 RUN_DIR="${OUT_BASE}/${TS}"
 ERR_LOG="${RUN_DIR}/errors.log"
 
-# Patterns (grep)
-VS_GREP='LTM::Virtual|Availability'
-POOL_GREP='LTM::Pool|Availability'
-NODE_GREP='LTM::Node|Availability'
-ASM_GREP='asm policy'
-
 #######################################
 # PRECHECKS
 #######################################
@@ -35,131 +29,120 @@ read -s -p "Mot de passe SSH: " SSH_PASS
 echo
 
 #######################################
-# SSH helper
-# On arrive en tmsh => on force bash via "run util bash -c"
+# SSH helper (tmsh-login safe)
+# run util bash -c '...'
 #######################################
 ssh_exec() {
   local HOST="$1"
   local CMD="$2"
 
-  # -n évite de consommer stdin (important pour while read)
+  # Escape single quotes for: run util bash -c '...'
+  local ESCAPED
+  ESCAPED="${CMD//\'/\'\\\'\'}"
+
   sshpass -p "$SSH_PASS" ssh -n \
     -o StrictHostKeyChecking=no \
     -o ConnectTimeout=15 \
     -o LogLevel=Error \
     "${SSH_USER}@${HOST}" \
-    "run util bash -c \"$CMD\""
+    "run util bash -c '$ESCAPED'"
 }
 
-#######################################
-# Partitions
-#######################################
 get_partitions() {
   local HOST="$1"
-  # sort -u for safety, remove empty lines
-  ssh_exec "$HOST" "tmsh -c 'list auth partition one-line' | awk '{print \$3}' | sed '/^$/d' | sort -u"
+  ssh_exec "$HOST" "tmsh -c \"list auth partition one-line\"" \
+    | awk '{print $3}' \
+    | sed '/^$/d' \
+    | sort -u
 }
 
-#######################################
-# Host checks
-#######################################
+run_tmsh_in_partition() {
+  local HOST="$1"
+  local PART="$2"
+  local TMSH_CMD="$3"
+  ssh_exec "$HOST" "tmsh -c \"cd /${PART}; ${TMSH_CMD}\""
+}
+
 run_checks_for_host() {
   local HOST="$1"
   local HOST_DIR="${RUN_DIR}/${HOST}"
   mkdir -p "$HOST_DIR"
 
-  local VS_OUT="${HOST_DIR}/virtual_servers.txt"
+  local ASM_OUT="${HOST_DIR}/asm_policies.txt"
   local POOL_OUT="${HOST_DIR}/pools.txt"
   local NODE_OUT="${HOST_DIR}/nodes.txt"
-  local ASM_OUT="${HOST_DIR}/asm_policies.txt"
 
-  : > "$VS_OUT"
+  : > "$ASM_OUT"
   : > "$POOL_OUT"
   : > "$NODE_OUT"
-  : > "$ASM_OUT"
 
-  echo "======================================"
-  echo "➡️  BIG-IP : $HOST"
-  echo "======================================"
-
-  ###################################
-  # ASM (global, no cd)
-  ###################################
-  echo "🔎 ASM policies"
-  if ! ssh_exec "$HOST" "tmsh -c 'list asm policy recursive' | grep -i \"$ASM_GREP\"" \
-      > "$ASM_OUT" 2>>"$ERR_LOG"; then
-    echo "[$HOST] ❌ ASM policies failed" >>"$ERR_LOG"
+  # ---- ASM (global) ----
+  if ! ssh_exec "$HOST" "tmsh -c \"list asm policy recursive\"" > "${ASM_OUT}.raw" 2>>"$ERR_LOG"; then
+    echo "[$HOST] ❌ ASM tmsh failed" >>"$ERR_LOG"
+  else
+    # Filtre, sinon fallback raw
+    grep -Ei "asm policy" "${ASM_OUT}.raw" > "$ASM_OUT" || true
+    if [[ ! -s "$ASM_OUT" ]]; then
+      mv -f "${ASM_OUT}.raw" "$ASM_OUT"
+    else
+      rm -f "${ASM_OUT}.raw"
+    fi
   fi
 
-  ###################################
-  # Partitions
-  ###################################
-  echo "🔎 Partitions"
+  # ---- Partitions ----
+  local PARTS
   PARTS="$(get_partitions "$HOST" 2>>"$ERR_LOG" || true)"
   if [[ -z "${PARTS:-}" ]]; then
     echo "[$HOST] ⚠️ Partitions non récupérées, fallback /Common" >>"$ERR_LOG"
     PARTS="Common"
   fi
 
-  ###################################
-  # LTM objects per partition
-  ###################################
+  # ---- Pools + Nodes (toutes partitions) ----
   while IFS= read -r P || [[ -n "$P" ]]; do
     [[ -z "$P" ]] && continue
 
-    # Header per partition for readability
+    # Pools (pas d'affichage partition dans le shell, uniquement dans le fichier)
     {
       echo "===== /$P ====="
-    } >> "$VS_OUT"
-    {
-      echo "===== /$P ====="
+      if OUT=$(run_tmsh_in_partition "$HOST" "$P" "show ltm pool recursive members" 2>>"$ERR_LOG"); then
+        F=$(printf "%s\n" "$OUT" | grep -Eai "ltm::pool|availability" || true)
+        if [[ -n "$F" ]]; then
+          printf "%s\n\n" "$F"
+        else
+          printf "%s\n\n" "$OUT"
+        fi
+      else
+        echo "[$HOST] ❌ Pools failed in /$P" >>"$ERR_LOG"
+        echo "(ERROR pools /$P)"
+        echo
+      fi
     } >> "$POOL_OUT"
-    {
-      echo "===== /$P ====="
-    } >> "$NODE_OUT"
-
-    # VS
-    echo "  🔎 VS (/$(printf "%s" "$P"))"
-    if ! ssh_exec "$HOST" \
-      "tmsh -c \"cd /${P}; show ltm virtual recursive\" | grep -E \"$VS_GREP\" || true" \
-      >> "$VS_OUT" 2>>"$ERR_LOG"; then
-      echo "[$HOST] ❌ VS failed in /$P" >>"$ERR_LOG"
-    fi
-    echo >> "$VS_OUT"
-
-    # Pools
-    echo "  🔎 Pools (/$(printf "%s" "$P"))"
-    if ! ssh_exec "$HOST" \
-      "tmsh -c \"cd /${P}; show ltm pool recursive members\" | grep -E \"$POOL_GREP\" || true" \
-      >> "$POOL_OUT" 2>>"$ERR_LOG"; then
-      echo "[$HOST] ❌ Pools failed in /$P" >>"$ERR_LOG"
-    fi
-    echo >> "$POOL_OUT"
 
     # Nodes
-    echo "  🔎 Nodes (/$(printf "%s" "$P"))"
-    if ! ssh_exec "$HOST" \
-      "tmsh -c \"cd /${P}; show ltm node recursive\" | grep -E \"$NODE_GREP\" || true" \
-      >> "$NODE_OUT" 2>>"$ERR_LOG"; then
-      echo "[$HOST] ❌ Nodes failed in /$P" >>"$ERR_LOG"
-    fi
-    echo >> "$NODE_OUT"
+    {
+      echo "===== /$P ====="
+      if OUT=$(run_tmsh_in_partition "$HOST" "$P" "show ltm node recursive" 2>>"$ERR_LOG"); then
+        F=$(printf "%s\n" "$OUT" | grep -Eai "ltm::node|availability" || true)
+        if [[ -n "$F" ]]; then
+          printf "%s\n\n" "$F"
+        else
+          printf "%s\n\n" "$OUT"
+        fi
+      else
+        echo "[$HOST] ❌ Nodes failed in /$P" >>"$ERR_LOG"
+        echo "(ERROR nodes /$P)"
+        echo
+      fi
+    } >> "$NODE_OUT"
 
   done <<< "$PARTS"
-
-  echo "✅ Export terminé pour $HOST"
-  echo "   - $VS_OUT"
-  echo "   - $POOL_OUT"
-  echo "   - $NODE_OUT"
-  echo "   - $ASM_OUT"
-  echo
 }
 
 #######################################
-# MAIN
+# MAIN LOOP (silencieux)
 #######################################
 echo
-echo "📋 F5 Check (tmsh login) – Run: $TS"
+echo "📋 F5 Check (silencieux, tmsh-login) – Run: $TS"
 echo "📁 Résultats : $RUN_DIR"
 echo "🧾 Erreurs   : $ERR_LOG"
 echo
@@ -167,9 +150,17 @@ echo
 while IFS= read -r LINE || [[ -n "$LINE" ]]; do
   HOST="$(echo "$LINE" | tr -d '\r' | xargs)"
   [[ -z "$HOST" || "$HOST" =~ ^# ]] && continue
-  run_checks_for_host "$HOST"
+
+  printf "➡️  %-30s ... " "$HOST"
+  if run_checks_for_host "$HOST"; then
+    echo "✅ OK"
+  else
+    echo "❌ KO"
+    echo "[$HOST] ❌ run_checks_for_host failed" >>"$ERR_LOG"
+  fi
 done < "$DEVICES_FILE"
 
+echo
 echo "🏁 Terminé"
 if [[ -s "$ERR_LOG" ]]; then
   echo "⚠️  Des erreurs ont été détectées : $ERR_LOG"
