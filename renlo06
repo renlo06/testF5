@@ -19,6 +19,7 @@ done
 
 [[ -f "$DEVICES_FILE" ]] || { echo "❌ Fichier équipements introuvable : $DEVICES_FILE"; exit 1; }
 mkdir -p "$RUN_DIR"
+: > "$ERR_LOG"
 
 #######################################
 # INPUTS
@@ -54,31 +55,31 @@ run_checks_for_host() {
   echo "➡️  BIG-IP : $HOST"
   echo "======================================"
 
-  # ASM policies (❗ sans cd /)
+  # ASM policies (pas de cd)
   echo "🔎 ASM policies"
   ssh_exec "$HOST" \
     'tmsh -c "list asm policy recursive" | grep "asm policy"' \
     > "${HOST_DIR}/asm_policies.txt" 2>>"$ERR_LOG" || \
     echo "[$HOST] ❌ ASM policies failed" >>"$ERR_LOG"
 
-  # Virtual Servers
+  # Virtual Servers (pas de cd /)
   echo "🔎 Virtual Servers"
   ssh_exec "$HOST" \
-    'tmsh -c "cd /; show ltm virtual recursive" | grep "LTM::Virtual\|Availability"' \
+    'tmsh -c "show ltm virtual recursive" | grep -E "LTM::Virtual|Availability"' \
     > "${HOST_DIR}/virtual_servers.txt" 2>>"$ERR_LOG" || \
     echo "[$HOST] ❌ Virtual Servers failed" >>"$ERR_LOG"
 
-  # Pools
+  # Pools (pas de cd /)
   echo "🔎 Pools"
   ssh_exec "$HOST" \
-    'tmsh -c "cd /; show ltm pool recursive members" | grep "LTM::Pool\|Availability"' \
+    'tmsh -c "show ltm pool recursive members" | grep -E "LTM::Pool|Availability"' \
     > "${HOST_DIR}/pools.txt" 2>>"$ERR_LOG" || \
     echo "[$HOST] ❌ Pools failed" >>"$ERR_LOG"
 
-  # Nodes
+  # Nodes (pas de cd /)
   echo "🔎 Nodes"
   ssh_exec "$HOST" \
-    'tmsh -c "cd /; show ltm node recursive" | grep "LTM::Node\|Availability"' \
+    'tmsh -c "show ltm node recursive" | grep -E "LTM::Node|Availability"' \
     > "${HOST_DIR}/nodes.txt" 2>>"$ERR_LOG" || \
     echo "[$HOST] ❌ Nodes failed" >>"$ERR_LOG"
 
@@ -90,12 +91,10 @@ run_checks_for_host() {
 # MAIN
 #######################################
 echo
-echo "📋 F5 Check (tmsh)"
-echo "📅 Run : $TS"
-echo "📁 Résultats : $RUN_DIR"
+echo "📋 F5 Check (tmsh) – Run: $TS"
+echo "📁 Sortie : $RUN_DIR"
+echo "🧾 Erreurs: $ERR_LOG"
 echo
-
-: > "$ERR_LOG"
 
 while IFS= read -r LINE || [[ -n "$LINE" ]]; do
   HOST="$(echo "$LINE" | tr -d '\r' | xargs)"
@@ -104,8 +103,9 @@ while IFS= read -r LINE || [[ -n "$LINE" ]]; do
 done < "$DEVICES_FILE"
 
 echo "🏁 Terminé"
+echo "📁 Résultats : $RUN_DIR"
 if [[ -s "$ERR_LOG" ]]; then
-  echo "⚠️  Erreurs détectées : $ERR_LOG"
+  echo "⚠️  Des erreurs ont été détectées : $ERR_LOG"
 else
   echo "✅ Aucun échec détecté"
 fi
