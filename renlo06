@@ -28,14 +28,12 @@ read -s -p "Mot de passe SSH: " SSH_PASS
 echo
 
 #######################################
-# SSH helper (ROBUST QUOTING)
+# SSH helper (quoting robuste)
 #######################################
 ssh_exec() {
   local HOST="$1"
   local CMD="$2"
 
-  # -n : évite que ssh lise stdin (important dans une boucle while read)
-  # bash -lc '<CMD>' : garde intact pipes/quotes du CMD
   sshpass -p "$SSH_PASS" ssh -n \
     -o StrictHostKeyChecking=no \
     -o ConnectTimeout=15 \
@@ -45,7 +43,7 @@ ssh_exec() {
 }
 
 #######################################
-# Run checks for one host
+# Checks par équipement
 #######################################
 run_checks_for_host() {
   local HOST="$1"
@@ -56,29 +54,33 @@ run_checks_for_host() {
   echo "➡️  BIG-IP : $HOST"
   echo "======================================"
 
-  # 1) ASM policies
+  # ASM policies (❗ sans cd /)
   echo "🔎 ASM policies"
-  if ! ssh_exec "$HOST" 'tmsh -c "cd /; list asm policy recursive" | grep "asm policy"'; then
+  ssh_exec "$HOST" \
+    'tmsh -c "list asm policy recursive" | grep "asm policy"' \
+    > "${HOST_DIR}/asm_policies.txt" 2>>"$ERR_LOG" || \
     echo "[$HOST] ❌ ASM policies failed" >>"$ERR_LOG"
-  fi > "${HOST_DIR}/asm_policies.txt" 2>>"$ERR_LOG"
 
-  # 2) Virtual Servers (typo fix: virtual)
+  # Virtual Servers
   echo "🔎 Virtual Servers"
-  if ! ssh_exec "$HOST" 'tmsh -c "cd /; show ltm virtual recursive" | grep "LTM::Virtual\|Availability"'; then
+  ssh_exec "$HOST" \
+    'tmsh -c "cd /; show ltm virtual recursive" | grep "LTM::Virtual\|Availability"' \
+    > "${HOST_DIR}/virtual_servers.txt" 2>>"$ERR_LOG" || \
     echo "[$HOST] ❌ Virtual Servers failed" >>"$ERR_LOG"
-  fi > "${HOST_DIR}/virtual_servers.txt" 2>>"$ERR_LOG"
 
-  # 3) Pools
+  # Pools
   echo "🔎 Pools"
-  if ! ssh_exec "$HOST" 'tmsh -c "cd /; show ltm pool recursive members" | grep "LTM::Pool\|Availability"'; then
+  ssh_exec "$HOST" \
+    'tmsh -c "cd /; show ltm pool recursive members" | grep "LTM::Pool\|Availability"' \
+    > "${HOST_DIR}/pools.txt" 2>>"$ERR_LOG" || \
     echo "[$HOST] ❌ Pools failed" >>"$ERR_LOG"
-  fi > "${HOST_DIR}/pools.txt" 2>>"$ERR_LOG"
 
-  # 4) Nodes
+  # Nodes
   echo "🔎 Nodes"
-  if ! ssh_exec "$HOST" 'tmsh -c "cd /; show ltm node recursive" | grep "LTM::Node\|Availability"'; then
+  ssh_exec "$HOST" \
+    'tmsh -c "cd /; show ltm node recursive" | grep "LTM::Node\|Availability"' \
+    > "${HOST_DIR}/nodes.txt" 2>>"$ERR_LOG" || \
     echo "[$HOST] ❌ Nodes failed" >>"$ERR_LOG"
-  fi > "${HOST_DIR}/nodes.txt" 2>>"$ERR_LOG"
 
   echo "✅ Export terminé pour $HOST"
   echo
@@ -88,9 +90,9 @@ run_checks_for_host() {
 # MAIN
 #######################################
 echo
-echo "📋 F5 Check (tmsh) – Run: $TS"
-echo "📁 Sortie : $RUN_DIR"
-echo "🧾 Erreurs: $ERR_LOG"
+echo "📋 F5 Check (tmsh)"
+echo "📅 Run : $TS"
+echo "📁 Résultats : $RUN_DIR"
 echo
 
 : > "$ERR_LOG"
@@ -102,9 +104,8 @@ while IFS= read -r LINE || [[ -n "$LINE" ]]; do
 done < "$DEVICES_FILE"
 
 echo "🏁 Terminé"
-echo "📁 Résultats : $RUN_DIR"
 if [[ -s "$ERR_LOG" ]]; then
-  echo "⚠️  Des erreurs ont été détectées : $ERR_LOG"
+  echo "⚠️  Erreurs détectées : $ERR_LOG"
 else
   echo "✅ Aucun échec détecté"
 fi
