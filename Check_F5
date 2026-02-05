@@ -1,15 +1,55 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Liste des partitions visibles pour l'utilisateur courant
-tmsh -c "list auth partition one-line" \
-| awk '{print $3}' \
-| while IFS= read -r P; do
-    [[ -z "$P" ]] && continue
-    echo "===== /$P ====="
-    # Liste les VS de la partition
-    tmsh -c "cd /$P; list ltm virtual one-line" \
-    | awk '/^ltm virtual \//{print $3}' \
+#######################################
+# PRECHECKS
+#######################################
+for bin in ssh sshpass awk sed; do
+  command -v "$bin" >/dev/null || { echo "❌ $bin requis"; exit 1; }
+done
+
+#######################################
+# INPUTS
+#######################################
+read -rp "Nom/IP de l'équipement BIG-IP: " HOST
+read -rp "Utilisateur SSH (compte qui arrive en tmsh): " SSH_USER
+read -s -rp "Mot de passe SSH: " SSH_PASS
+echo
+
+#######################################
+# SSH helper (compte qui arrive en tmsh)
+#######################################
+ssh_exec() {
+  local cmd="$1"
+
+  sshpass -p "$SSH_PASS" ssh -n \
+    -o StrictHostKeyChecking=no \
+    -o ConnectTimeout=15 \
+    -o LogLevel=Error \
+    "${SSH_USER}@${HOST}" \
+    "run util bash -c \"$cmd\""
+}
+
+#######################################
+# MAIN: Liste des VS par partition visible
+#######################################
+# 1) Récupérer les partitions visibles
+PARTS="$(ssh_exec "tmsh -c \"list auth partition one-line\" | awk '{print \\$3}' | sed '/^$/d' | sort -u" || true)"
+
+if [[ -z "${PARTS:-}" ]]; then
+  echo "❌ Impossible de récupérer les partitions (droits insuffisants ?)"
+  exit 1
+fi
+
+# 2) Pour chaque partition : cd /Partition ; list ltm virtual one-line
+#    et afficher uniquement les fullPath des VS
+while IFS= read -r P || [[ -n "$P" ]]; do
+  [[ -z "$P" ]] && continue
+
+  echo "===== /$P ====="
+
+  ssh_exec "tmsh -c \"cd /${P}; list ltm virtual one-line\" | awk '/^ltm virtual \\/{print \\$3}'" \
     || true
-    echo
-  done
+
+  echo
+done <<< "$PARTS"
