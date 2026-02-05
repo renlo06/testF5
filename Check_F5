@@ -17,19 +17,17 @@ sshpass -p "$SSH_PASS" ssh -T \
   "${SSH_USER}@${HOST}" "run util bash -s" <<'REMOTE_BASH'
 set -euo pipefail
 
-# Partitions visibles
-PARTS="$(
+# --------------------------
+# Helpers
+# --------------------------
+get_partitions() {
   tmsh -c "list auth partition one-line" \
   | awk '$1=="auth" && $2=="partition" {print $3}' \
   | sed '/^$/d' \
   | sort -u
-)"
+}
 
-if [[ -z "${PARTS:-}" ]]; then
-  echo "❌ Aucune partition visible (droits insuffisants ?) ou sortie vide."
-  exit 1
-fi
-
+# VS list (recursive)
 get_vs_list() {
   local P="$1"
   tmsh -c "cd /${P}; list ltm virtual recursive one-line" 2>/dev/null \
@@ -37,11 +35,7 @@ get_vs_list() {
 }
 
 get_vs_availability() {
-  local P="$1"
-  local VS="$2"
-
-  # On extrait la 1ère occurrence de "Availability"
-  # Format souvent: "Availability : available"
+  local P="$1" VS="$2"
   local avail
   avail="$(
     tmsh -c "cd /${P}; show ltm virtual ${VS}" 2>/dev/null \
@@ -52,32 +46,112 @@ get_vs_availability() {
           exit
         }'
   )"
-
-  if [[ -z "${avail:-}" ]]; then
-    echo "UNKNOWN"
-  else
-    echo "$avail"
-  fi
+  [[ -n "${avail:-}" ]] && printf "%s" "$avail" || printf "UNKNOWN"
 }
+
+# Pool list (recursive)
+get_pool_list() {
+  local P="$1"
+  tmsh -c "cd /${P}; list ltm pool recursive one-line" 2>/dev/null \
+  | awk '$1=="ltm" && $2=="pool" {print $3}'
+}
+
+get_pool_availability() {
+  local P="$1" POOL="$2"
+  local avail
+  avail="$(
+    tmsh -c "cd /${P}; show ltm pool ${POOL}" 2>/dev/null \
+    | awk -F':' '
+        $1 ~ /Availability/ {
+          gsub(/^[ \t]+/, "", $2);
+          print $2;
+          exit
+        }'
+  )"
+  [[ -n "${avail:-}" ]] && printf "%s" "$avail" || printf "UNKNOWN"
+}
+
+# Pool members availability:
+# Parse blocks like:
+#   LTM::Pool Member: /Common/node:port
+#   ...
+#   Availability : available
+get_pool_members_status() {
+  local P="$1" POOL="$2"
+
+  tmsh -c "cd /${P}; show ltm pool ${POOL} members" 2>/dev/null \
+  | awk -F': ' '
+      BEGIN { member=""; }
+      /^LTM::Pool Member:/ {
+        member=$2;
+        gsub(/^[ \t]+|[ \t]+$/, "", member);
+      }
+      member != "" && $1 ~ /^Availability/ {
+        avail=$2;
+        gsub(/^[ \t]+|[ \t]+$/, "", avail);
+        if (avail == "") avail="UNKNOWN";
+        printf "%s ; %s\n", member, avail;
+        member="";
+      }
+    '
+}
+
+# --------------------------
+# MAIN
+# --------------------------
+PARTS="$(get_partitions || true)"
+if [[ -z "${PARTS:-}" ]]; then
+  echo "❌ Aucune partition visible (droits insuffisants ?) ou sortie vide."
+  exit 1
+fi
 
 while IFS= read -r P || [[ -n "$P" ]]; do
   [[ -z "$P" ]] && continue
 
   echo "===== /$P ====="
 
+  # -------- VS --------
+  echo "-- Virtual Servers"
   VS_LIST="$(get_vs_list "$P" || true)"
   if [[ -z "${VS_LIST:-}" ]]; then
     echo "(0 VS visibles dans /$P)"
-    echo
-    continue
+  else
+    while IFS= read -r VS || [[ -n "$VS" ]]; do
+      [[ -z "$VS" ]] && continue
+      AVAIL="$(get_vs_availability "$P" "$VS")"
+      printf "%s ; %s\n" "$VS" "$AVAIL"
+    done <<< "$VS_LIST"
   fi
 
-  # Affichage VS + Availability
-  while IFS= read -r VS || [[ -n "$VS" ]]; do
-    [[ -z "$VS" ]] && continue
-    AVAIL="$(get_vs_availability "$P" "$VS")"
-    printf "%s ; %s\n" "$VS" "$AVAIL"
-  done <<< "$VS_LIST"
+  echo
+
+  # -------- POOLS + MEMBERS --------
+  echo "-- Pools"
+  POOL_LIST="$(get_pool_list "$P" || true)"
+  if [[ -z "${POOL_LIST:-}" ]]; then
+    echo "(0 Pools visibles dans /$P)"
+  else
+    while IFS= read -r POOL || [[ -n "$POOL" ]]; do
+      [[ -z "$POOL" ]] && continue
+
+      PAVAIL="$(get_pool_availability "$P" "$POOL")"
+      printf "%s ; %s\n" "$POOL" "$PAVAIL"
+
+      # Members
+      MEMBERS="$(get_pool_members_status "$P" "$POOL" || true)"
+      if [[ -z "${MEMBERS:-}" ]]; then
+        echo "  (0 members ou statut non lisible)"
+      else
+        # indent members
+        while IFS= read -r line || [[ -n "$line" ]]; do
+          [[ -z "$line" ]] && continue
+          printf "  %s\n" "$line"
+        done <<< "$MEMBERS"
+      fi
+
+      echo
+    done <<< "$POOL_LIST"
+  fi
 
   echo
 done <<< "$PARTS"
