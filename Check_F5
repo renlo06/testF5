@@ -17,33 +17,22 @@ read -s -rp "Mot de passe SSH: " SSH_PASS
 echo
 
 #######################################
-# SSH helper (tmsh-login SAFE)
-# Exécute toujours via: run util bash -c '...'
-# Et protège les quotes simples dans la commande.
+# REMOTE EXEC via stdin (NO QUOTING HELL)
 #######################################
-ssh_exec() {
-  local cmd="$1"
-  local escaped
-  escaped="${cmd//\'/\'\\\'\'}"   # '  ->  '\''
-  sshpass -p "$SSH_PASS" ssh -n \
-    -o StrictHostKeyChecking=no \
-    -o ConnectTimeout=15 \
-    -o LogLevel=Error \
-    "${SSH_USER}@${HOST}" \
-    "run util bash -c '$escaped'"
-}
+sshpass -p "$SSH_PASS" ssh -T -o StrictHostKeyChecking=no -o ConnectTimeout=15 -o LogLevel=Error \
+  "${SSH_USER}@${HOST}" "run util bash -s" <<'REMOTE_BASH'
+set -euo pipefail
 
-#######################################
-# MAIN
-#######################################
-# 1) Partitions visibles (filtre strict)
+# 1) Récupération des partitions visibles (filtre strict)
 PARTS="$(
-  ssh_exec "tmsh -c \"list auth partition one-line\" | awk '\$1==\"auth\" && \$2==\"partition\" {print \$3}' | sed '/^$/d' | sort -u" \
-  || true
+  tmsh -c "list auth partition one-line" \
+  | awk '$1=="auth" && $2=="partition" {print $3}' \
+  | sed '/^$/d' \
+  | sort -u
 )"
 
 if [[ -z "${PARTS:-}" ]]; then
-  echo "❌ Impossible de récupérer les partitions (droits insuffisants ?) ou sortie vide."
+  echo "❌ Aucune partition visible (droits insuffisants ?) ou sortie vide."
   exit 1
 fi
 
@@ -52,6 +41,13 @@ while IFS= read -r P || [[ -n "$P" ]]; do
   [[ -z "$P" ]] && continue
 
   echo "===== /$P ====="
-  ssh_exec "tmsh -c \"cd /${P}; list ltm virtual one-line\" | awk '/^ltm virtual \\/{print \$3}'" || true
+
+  # On se place dans la partition et on liste les VS
+  # (le cd /$P est valide car $P = nom de partition, ex: Common, Prod, etc.)
+  tmsh -c "cd /${P}; list ltm virtual one-line" \
+  | awk '/^ltm virtual \// {print $3}' \
+  || true
+
   echo
 done <<< "$PARTS"
+REMOTE_BASH
