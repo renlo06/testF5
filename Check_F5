@@ -1,29 +1,22 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-#######################################
-# PRECHECKS
-#######################################
 for bin in ssh sshpass awk sed sort; do
   command -v "$bin" >/dev/null || { echo "❌ $bin requis"; exit 1; }
 done
 
-#######################################
-# INPUTS
-#######################################
 read -rp "Nom/IP de l'équipement BIG-IP: " HOST
 read -rp "Utilisateur SSH (compte qui arrive en tmsh): " SSH_USER
 read -s -rp "Mot de passe SSH: " SSH_PASS
 echo
 
-#######################################
-# REMOTE EXEC via stdin (NO QUOTING HELL)
-#######################################
-sshpass -p "$SSH_PASS" ssh -T -o StrictHostKeyChecking=no -o ConnectTimeout=15 -o LogLevel=Error \
+sshpass -p "$SSH_PASS" ssh -T \
+  -o StrictHostKeyChecking=no \
+  -o ConnectTimeout=15 \
+  -o LogLevel=Error \
   "${SSH_USER}@${HOST}" "run util bash -s" <<'REMOTE_BASH'
 set -euo pipefail
 
-# 1) Récupération des partitions visibles (filtre strict)
 PARTS="$(
   tmsh -c "list auth partition one-line" \
   | awk '$1=="auth" && $2=="partition" {print $3}' \
@@ -36,16 +29,14 @@ if [[ -z "${PARTS:-}" ]]; then
   exit 1
 fi
 
-# 2) Liste des VS par partition
 while IFS= read -r P || [[ -n "$P" ]]; do
   [[ -z "$P" ]] && continue
 
   echo "===== /$P ====="
 
-  # On se place dans la partition et on liste les VS
-  # (le cd /$P est valide car $P = nom de partition, ex: Common, Prod, etc.)
+  # Important: en contexte de partition, les VS peuvent être affichées sans /Common/ au début
   tmsh -c "cd /${P}; list ltm virtual one-line" \
-  | awk '/^ltm virtual \// {print $3}' \
+  | awk '$1=="ltm" && $2=="virtual" {print $3}' \
   || true
 
   echo
