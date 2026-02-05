@@ -17,6 +17,7 @@ sshpass -p "$SSH_PASS" ssh -T \
   "${SSH_USER}@${HOST}" "run util bash -s" <<'REMOTE_BASH'
 set -euo pipefail
 
+# Partitions visibles
 PARTS="$(
   tmsh -c "list auth partition one-line" \
   | awk '$1=="auth" && $2=="partition" {print $3}' \
@@ -34,10 +35,18 @@ while IFS= read -r P || [[ -n "$P" ]]; do
 
   echo "===== /$P ====="
 
-  # Important: en contexte de partition, les VS peuvent être affichées sans /Common/ au début
-  tmsh -c "cd /${P}; list ltm virtual one-line" \
-  | awk '$1=="ltm" && $2=="virtual" {print $3}' \
-  || true
+  # IMPORTANT: recursive => inclut les sous-folders (ex /Common/app1/...)
+  # On imprime le nom/chemin de la VS (3e champ après "ltm virtual")
+  OUT="$(
+    tmsh -c "cd /${P}; list ltm virtual recursive one-line" 2>/dev/null \
+    | awk '$1=="ltm" && $2=="virtual" {print $3}'
+  )" || true
+
+  if [[ -n "${OUT:-}" ]]; then
+    printf "%s\n" "$OUT"
+  else
+    echo "(0 VS visibles dans /$P)"
+  fi
 
   echo
 done <<< "$PARTS"
