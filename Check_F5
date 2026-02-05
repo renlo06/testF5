@@ -33,21 +33,29 @@ ssh_exec() {
 #######################################
 # MAIN: Liste des VS par partition visible
 #######################################
-# Partitions visibles: on prend le dernier champ (Common, Prod, etc.)
-PARTS="$(ssh_exec "tmsh -c \"list auth partition one-line\" | awk '{print \$NF}' | sed '/^$/d' | sort -u" || true)"
+# Extraction STRICTE des partitions: "auth partition <NAME> { ... }" -> <NAME>
+PARTS="$(ssh_exec \
+  "tmsh -c \"list auth partition one-line\" \
+   | awk '\$1==\"auth\" && \$2==\"partition\" {print \$3}' \
+   | sed 's/[{}]//g' \
+   | sed '/^$/d' \
+   | sort -u" || true)"
 
 if [[ -z "${PARTS:-}" ]]; then
   echo "❌ Impossible de récupérer les partitions (droits insuffisants ?)"
   exit 1
 fi
 
-# Pour chaque partition : cd /Partition ; list ltm virtual one-line ; extraire le fullPath (3e champ)
+# Pour chaque partition: cd /Partition ; list ltm virtual one-line ; afficher les fullPath
 while IFS= read -r P || [[ -n "$P" ]]; do
   [[ -z "$P" ]] && continue
 
   echo "===== /$P ====="
 
-  ssh_exec "tmsh -c \"cd /${P}; list ltm virtual one-line\" | awk '/^ltm virtual \\/{print \$3}'" || true
+  ssh_exec \
+    "tmsh -c \"cd /${P}; list ltm virtual one-line\" \
+     | awk '/^ltm virtual \\/{print \$3}'" \
+    || true
 
   echo
 done <<< "$PARTS"
