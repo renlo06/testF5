@@ -17,9 +17,6 @@ sshpass -p "$SSH_PASS" ssh -T \
   "${SSH_USER}@${HOST}" "run util bash -s" <<'REMOTE_BASH'
 set -euo pipefail
 
-# --------------------------
-# Helpers
-# --------------------------
 get_partitions() {
   tmsh -c "list auth partition one-line" \
   | awk '$1=="auth" && $2=="partition" {print $3}' \
@@ -27,7 +24,7 @@ get_partitions() {
   | sort -u
 }
 
-# VS list (recursive)
+# ---------- VS ----------
 get_vs_list() {
   local P="$1"
   tmsh -c "cd /${P}; list ltm virtual recursive one-line" 2>/dev/null \
@@ -39,17 +36,19 @@ get_vs_availability() {
   local avail
   avail="$(
     tmsh -c "cd /${P}; show ltm virtual ${VS}" 2>/dev/null \
-    | awk -F':' '
-        $1 ~ /Availability/ {
-          gsub(/^[ \t]+/, "", $2);
-          print $2;
+    | awk '
+        $0 ~ /^[[:space:]]*Availability[[:space:]]*:/ {
+          s=$0
+          sub(/^[[:space:]]*Availability[[:space:]]*:[[:space:]]*/, "", s)
+          gsub(/^[ \t]+|[ \t]+$/, "", s)
+          print s
           exit
         }'
   )"
   [[ -n "${avail:-}" ]] && printf "%s" "$avail" || printf "UNKNOWN"
 }
 
-# Pool list (recursive)
+# ---------- POOLS ----------
 get_pool_list() {
   local P="$1"
   tmsh -c "cd /${P}; list ltm pool recursive one-line" 2>/dev/null \
@@ -61,44 +60,67 @@ get_pool_availability() {
   local avail
   avail="$(
     tmsh -c "cd /${P}; show ltm pool ${POOL}" 2>/dev/null \
-    | awk -F':' '
-        $1 ~ /Availability/ {
-          gsub(/^[ \t]+/, "", $2);
-          print $2;
+    | awk '
+        $0 ~ /^[[:space:]]*Availability[[:space:]]*:/ {
+          s=$0
+          sub(/^[[:space:]]*Availability[[:space:]]*:[[:space:]]*/, "", s)
+          gsub(/^[ \t]+|[ \t]+$/, "", s)
+          print s
           exit
         }'
   )"
   [[ -n "${avail:-}" ]] && printf "%s" "$avail" || printf "UNKNOWN"
 }
 
-# Pool members availability:
-# Parse blocks like:
-#   LTM::Pool Member: /Common/node:port
-#   ...
-#   Availability : available
+# ✅ Members parser ROBUST (espaces variables + fallback State/Session)
 get_pool_members_status() {
   local P="$1" POOL="$2"
 
   tmsh -c "cd /${P}; show ltm pool ${POOL} members" 2>/dev/null \
-  | awk -F': ' '
+  | awk '
       BEGIN { member=""; }
+
       /^LTM::Pool Member:/ {
-        member=$2;
-        gsub(/^[ \t]+|[ \t]+$/, "", member);
+        member=$0
+        sub(/^LTM::Pool Member:[[:space:]]*/, "", member)
+        gsub(/^[ \t]+|[ \t]+$/, "", member)
+        next
       }
-      member != "" && $1 ~ /^Availability/ {
-        avail=$2;
-        gsub(/^[ \t]+|[ \t]+$/, "", avail);
-        if (avail == "") avail="UNKNOWN";
-        printf "%s ; %s\n", member, avail;
-        member="";
+
+      member != "" && $0 ~ /^[[:space:]]*Availability[[:space:]]*:/ {
+        avail=$0
+        sub(/^[[:space:]]*Availability[[:space:]]*:[[:space:]]*/, "", avail)
+        gsub(/^[ \t]+|[ \t]+$/, "", avail)
+        if (avail=="") avail="UNKNOWN"
+        printf "%s ; %s\n", member, avail
+        member=""
+        next
+      }
+
+      # Fallback si Availability n'existe pas
+      member != "" && $0 ~ /^[[:space:]]*State[[:space:]]*:/ {
+        st=$0
+        sub(/^[[:space:]]*State[[:space:]]*:[[:space:]]*/, "", st)
+        gsub(/^[ \t]+|[ \t]+$/, "", st)
+        if (st=="") st="UNKNOWN"
+        printf "%s ; %s\n", member, st
+        member=""
+        next
+      }
+
+      member != "" && $0 ~ /^[[:space:]]*Session[[:space:]]*:/ {
+        sess=$0
+        sub(/^[[:space:]]*Session[[:space:]]*:[[:space:]]*/, "", sess)
+        gsub(/^[ \t]+|[ \t]+$/, "", sess)
+        if (sess=="") sess="UNKNOWN"
+        printf "%s ; %s\n", member, sess
+        member=""
+        next
       }
     '
 }
 
-# --------------------------
-# MAIN
-# --------------------------
+# ---------- MAIN ----------
 PARTS="$(get_partitions || true)"
 if [[ -z "${PARTS:-}" ]]; then
   echo "❌ Aucune partition visible (droits insuffisants ?) ou sortie vide."
@@ -110,7 +132,7 @@ while IFS= read -r P || [[ -n "$P" ]]; do
 
   echo "===== /$P ====="
 
-  # -------- VS --------
+  # VS
   echo "-- Virtual Servers"
   VS_LIST="$(get_vs_list "$P" || true)"
   if [[ -z "${VS_LIST:-}" ]]; then
@@ -125,7 +147,7 @@ while IFS= read -r P || [[ -n "$P" ]]; do
 
   echo
 
-  # -------- POOLS + MEMBERS --------
+  # Pools + Members
   echo "-- Pools"
   POOL_LIST="$(get_pool_list "$P" || true)"
   if [[ -z "${POOL_LIST:-}" ]]; then
@@ -137,12 +159,10 @@ while IFS= read -r P || [[ -n "$P" ]]; do
       PAVAIL="$(get_pool_availability "$P" "$POOL")"
       printf "%s ; %s\n" "$POOL" "$PAVAIL"
 
-      # Members
       MEMBERS="$(get_pool_members_status "$P" "$POOL" || true)"
       if [[ -z "${MEMBERS:-}" ]]; then
         echo "  (0 members ou statut non lisible)"
       else
-        # indent members
         while IFS= read -r line || [[ -n "$line" ]]; do
           [[ -z "$line" ]] && continue
           printf "  %s\n" "$line"
