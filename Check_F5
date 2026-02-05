@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-for bin in ssh sshpass awk sed sort; do
+for bin in ssh sshpass sed sort awk; do
   command -v "$bin" >/dev/null || { echo "❌ $bin requis"; exit 1; }
 done
 
@@ -16,6 +16,35 @@ sshpass -p "$SSH_PASS" ssh -T \
   -o LogLevel=Error \
   "${SSH_USER}@${HOST}" "run util bash -s" <<'REMOTE_BASH'
 set -euo pipefail
+
+trim() {
+  local s="$1"
+  # trim leading
+  s="${s#"${s%%[![:space:]]*}"}"
+  # trim trailing
+  s="${s%"${s##*[![:space:]]}"}"
+  printf "%s" "$s"
+}
+
+first_availability_from_show() {
+  # lit stdin, retourne la valeur après "Availability :"
+  local line val
+  while IFS= read -r line; do
+    case "$line" in
+      *Availability*:* )
+        # garde ce qui est après le premier ':'
+        val="${line#*:}"
+        val="$(trim "$val")"
+        if [[ -n "$val" ]]; then
+          printf "%s" "$val"
+          return 0
+        fi
+        ;;
+    esac
+  done
+  printf "UNKNOWN"
+  return 0
+}
 
 get_partitions() {
   tmsh -c "list auth partition one-line" \
@@ -33,19 +62,7 @@ get_vs_list() {
 
 get_vs_availability() {
   local P="$1" VS="$2"
-  local avail
-  avail="$(
-    tmsh -c "cd /${P}; show ltm virtual ${VS}" 2>/dev/null \
-    | awk '
-        $0 ~ /^[[:space:]]*Availability[[:space:]]*:/ {
-          s=$0
-          sub(/^[[:space:]]*Availability[[:space:]]*:[[:space:]]*/, "", s)
-          gsub(/^[ \t]+|[ \t]+$/, "", s)
-          print s
-          exit
-        }'
-  )"
-  [[ -n "${avail:-}" ]] && printf "%s" "$avail" || printf "UNKNOWN"
+  tmsh -c "cd /${P}; show ltm virtual ${VS}" 2>/dev/null | first_availability_from_show
 }
 
 # ---------- POOLS ----------
@@ -57,67 +74,53 @@ get_pool_list() {
 
 get_pool_availability() {
   local P="$1" POOL="$2"
-  local avail
-  avail="$(
-    tmsh -c "cd /${P}; show ltm pool ${POOL}" 2>/dev/null \
-    | awk '
-        $0 ~ /^[[:space:]]*Availability[[:space:]]*:/ {
-          s=$0
-          sub(/^[[:space:]]*Availability[[:space:]]*:[[:space:]]*/, "", s)
-          gsub(/^[ \t]+|[ \t]+$/, "", s)
-          print s
-          exit
-        }'
-  )"
-  [[ -n "${avail:-}" ]] && printf "%s" "$avail" || printf "UNKNOWN"
+  tmsh -c "cd /${P}; show ltm pool ${POOL}" 2>/dev/null | first_availability_from_show
 }
 
-# ✅ Members parser ROBUST (espaces variables + fallback State/Session)
+# ---------- POOL MEMBERS (bash parsing robuste) ----------
 get_pool_members_status() {
   local P="$1" POOL="$2"
+  local line member="" status="" val=""
 
   tmsh -c "cd /${P}; show ltm pool ${POOL} members" 2>/dev/null \
-  | awk '
-      BEGIN { member=""; }
+  | while IFS= read -r line; do
+      # Détecter début de bloc member
+      if [[ "$line" == LTM::Pool\ Member:* ]]; then
+        member="$(trim "${line#LTM::Pool Member:}")"
+        status=""
+        continue
+      fi
 
-      /^LTM::Pool Member:/ {
-        member=$0
-        sub(/^LTM::Pool Member:[[:space:]]*/, "", member)
-        gsub(/^[ \t]+|[ \t]+$/, "", member)
-        next
-      }
+      # Si on est dans un bloc member, attraper un statut
+      if [[ -n "$member" ]]; then
+        case "$line" in
+          *Availability*:* )
+            val="$(trim "${line#*:}")"
+            status="${val:-UNKNOWN}"
+            ;;
+          *State*:* )
+            # fallback si Availability absent
+            if [[ -z "$status" ]]; then
+              val="$(trim "${line#*:}")"
+              status="${val:-UNKNOWN}"
+            fi
+            ;;
+          *Session*:* )
+            if [[ -z "$status" ]]; then
+              val="$(trim "${line#*:}")"
+              status="${val:-UNKNOWN}"
+            fi
+            ;;
+        esac
 
-      member != "" && $0 ~ /^[[:space:]]*Availability[[:space:]]*:/ {
-        avail=$0
-        sub(/^[[:space:]]*Availability[[:space:]]*:[[:space:]]*/, "", avail)
-        gsub(/^[ \t]+|[ \t]+$/, "", avail)
-        if (avail=="") avail="UNKNOWN"
-        printf "%s ; %s\n", member, avail
-        member=""
-        next
-      }
-
-      # Fallback si Availability n'existe pas
-      member != "" && $0 ~ /^[[:space:]]*State[[:space:]]*:/ {
-        st=$0
-        sub(/^[[:space:]]*State[[:space:]]*:[[:space:]]*/, "", st)
-        gsub(/^[ \t]+|[ \t]+$/, "", st)
-        if (st=="") st="UNKNOWN"
-        printf "%s ; %s\n", member, st
-        member=""
-        next
-      }
-
-      member != "" && $0 ~ /^[[:space:]]*Session[[:space:]]*:/ {
-        sess=$0
-        sub(/^[[:space:]]*Session[[:space:]]*:[[:space:]]*/, "", sess)
-        gsub(/^[ \t]+|[ \t]+$/, "", sess)
-        if (sess=="") sess="UNKNOWN"
-        printf "%s ; %s\n", member, sess
-        member=""
-        next
-      }
-    '
+        # Dès qu'on a un status, on l’imprime et on reset le bloc
+        if [[ -n "$status" ]]; then
+          printf "%s ; %s\n" "$member" "$status"
+          member=""
+          status=""
+        fi
+      fi
+    done
 }
 
 # ---------- MAIN ----------
