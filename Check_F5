@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-for bin in ssh sshpass sed sort awk; do
+for bin in ssh sshpass awk sed sort; do
   command -v "$bin" >/dev/null || { echo "❌ $bin requis"; exit 1; }
 done
 
@@ -19,26 +19,19 @@ set -euo pipefail
 
 trim() {
   local s="$1"
-  # trim leading
   s="${s#"${s%%[![:space:]]*}"}"
-  # trim trailing
   s="${s%"${s##*[![:space:]]}"}"
   printf "%s" "$s"
 }
 
 first_availability_from_show() {
-  # lit stdin, retourne la valeur après "Availability :"
   local line val
   while IFS= read -r line; do
     case "$line" in
       *Availability*:* )
-        # garde ce qui est après le premier ':'
         val="${line#*:}"
         val="$(trim "$val")"
-        if [[ -n "$val" ]]; then
-          printf "%s" "$val"
-          return 0
-        fi
+        [[ -n "$val" ]] && { printf "%s" "$val"; return 0; }
         ;;
     esac
   done
@@ -77,50 +70,61 @@ get_pool_availability() {
   tmsh -c "cd /${P}; show ltm pool ${POOL}" 2>/dev/null | first_availability_from_show
 }
 
-# ---------- POOL MEMBERS (bash parsing robuste) ----------
+# ✅ Members parser ROBUST (tolérant + fallback)
 get_pool_members_status() {
   local P="$1" POOL="$2"
   local line member="" status="" val=""
 
-  tmsh -c "cd /${P}; show ltm pool ${POOL} members" 2>/dev/null \
-  | while IFS= read -r line; do
-      # Détecter début de bloc member
-      if [[ "$line" == LTM::Pool\ Member:* ]]; then
-        member="$(trim "${line#LTM::Pool Member:}")"
+  shopt -s nocasematch
+
+  local RAW
+  RAW="$(tmsh -c "cd /${P}; show ltm pool ${POOL} members" 2>/dev/null || true)"
+
+  while IFS= read -r line; do
+    if [[ "$line" == *"LTM::Pool Member:"* ]]; then
+      if [[ -n "$member" && -z "$status" ]]; then
+        printf "%s ; UNKNOWN\n" "$member"
+      fi
+      member="${line#*LTM::Pool Member:}"
+      member="$(trim "$member")"
+      status=""
+      continue
+    fi
+
+    if [[ -n "$member" ]]; then
+      if [[ "$line" == *"Availability"*:* ]]; then
+        val="${line#*:}"
+        val="$(trim "$val")"
+        status="${val:-UNKNOWN}"
+      elif [[ "$line" == *"State"*:* && -z "$status" ]]; then
+        val="${line#*:}"
+        val="$(trim "$val")"
+        status="${val:-UNKNOWN}"
+      elif [[ "$line" == *"Session"*:* && -z "$status" ]]; then
+        val="${line#*:}"
+        val="$(trim "$val")"
+        status="${val:-UNKNOWN}"
+      fi
+
+      if [[ -n "$status" ]]; then
+        printf "%s ; %s\n" "$member" "$status"
+        member=""
         status=""
-        continue
       fi
+    fi
+  done <<< "$RAW"
 
-      # Si on est dans un bloc member, attraper un statut
-      if [[ -n "$member" ]]; then
-        case "$line" in
-          *Availability*:* )
-            val="$(trim "${line#*:}")"
-            status="${val:-UNKNOWN}"
-            ;;
-          *State*:* )
-            # fallback si Availability absent
-            if [[ -z "$status" ]]; then
-              val="$(trim "${line#*:}")"
-              status="${val:-UNKNOWN}"
-            fi
-            ;;
-          *Session*:* )
-            if [[ -z "$status" ]]; then
-              val="$(trim "${line#*:}")"
-              status="${val:-UNKNOWN}"
-            fi
-            ;;
-        esac
+  if [[ -n "$member" && -z "$status" ]]; then
+    printf "%s ; UNKNOWN\n" "$member"
+  fi
 
-        # Dès qu'on a un status, on l’imprime et on reset le bloc
-        if [[ -n "$status" ]]; then
-          printf "%s ; %s\n" "$member" "$status"
-          member=""
-          status=""
-        fi
-      fi
-    done
+  # Fallback si rien ne ressemble à un bloc member
+  if ! grep -qi "LTM::Pool Member:" <<< "$RAW"; then
+    echo "__FALLBACK__"
+    printf "%s\n" "$RAW" | grep -Ei "Pool Member|Availability|State|Session" || true
+  fi
+
+  shopt -u nocasematch
 }
 
 # ---------- MAIN ----------
@@ -166,10 +170,19 @@ while IFS= read -r P || [[ -n "$P" ]]; do
       if [[ -z "${MEMBERS:-}" ]]; then
         echo "  (0 members ou statut non lisible)"
       else
-        while IFS= read -r line || [[ -n "$line" ]]; do
-          [[ -z "$line" ]] && continue
-          printf "  %s\n" "$line"
-        done <<< "$MEMBERS"
+        if grep -q "^__FALLBACK__$" <<< "$MEMBERS"; then
+          echo "  (format members différent — extrait brut ci-dessous)"
+          while IFS= read -r l || [[ -n "$l" ]]; do
+            [[ "$l" == "__FALLBACK__" ]] && continue
+            [[ -z "$l" ]] && continue
+            printf "  %s\n" "$l"
+          done <<< "$MEMBERS"
+        else
+          while IFS= read -r l || [[ -n "$l" ]]; do
+            [[ -z "$l" ]] && continue
+            printf "  %s\n" "$l"
+          done <<< "$MEMBERS"
+        fi
       fi
 
       echo
