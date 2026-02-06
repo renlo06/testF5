@@ -79,14 +79,14 @@ first_availability_from_show() {
 #######################################
 # Retourne lignes: "type ; name"
 get_wideips() {
-  tmsh -c "list gtm wideip recursive one-line" 2>/dev/null \
+  tmsh -c "cd /; list gtm wideip recursive one-line" 2>/dev/null \
   | awk '$1=="gtm" && $2=="wideip" {print $3 " ; " $4}' \
   | sed '/^$/d' | sort -u
 }
 
 get_wideip_avail() {
   local TYPE="$1" NAME="$2"
-  tmsh -c "show gtm wideip ${TYPE} ${NAME}" 2>/dev/null | first_availability_from_show
+  tmsh -c "cd /; show gtm wideip ${TYPE} ${NAME}" 2>/dev/null | first_availability_from_show
 }
 
 #######################################
@@ -94,14 +94,14 @@ get_wideip_avail() {
 #######################################
 # Retourne lignes: "type ; name"
 get_gtm_pools() {
-  tmsh -c "list gtm pool recursive one-line" 2>/dev/null \
+  tmsh -c "cd /; list gtm pool recursive one-line" 2>/dev/null \
   | awk '$1=="gtm" && $2=="pool" {print $3 " ; " $4}' \
   | sed '/^$/d' | sort -u
 }
 
 get_gtm_pool_avail() {
   local TYPE="$1" NAME="$2"
-  tmsh -c "show gtm pool ${TYPE} ${NAME}" 2>/dev/null | first_availability_from_show
+  tmsh -c "cd /; show gtm pool ${TYPE} ${NAME}" 2>/dev/null | first_availability_from_show
 }
 
 # Members parser (tolérant) pour GTM pool
@@ -112,10 +112,9 @@ get_gtm_pool_members_status() {
 
   shopt -s nocasematch
   local RAW
-  RAW="$(tmsh -c "show gtm pool ${TYPE} ${NAME} members" 2>/dev/null || true)"
+  RAW="$(tmsh -c "cd /; show gtm pool ${TYPE} ${NAME} members" 2>/dev/null || true)"
 
   while IFS= read -r line; do
-    # Beaucoup de sorties F5 utilisent "GTM::Pool Member:"
     if [[ "$line" == *"GTM::Pool Member:"* ]]; then
       if [[ -n "$member" && -z "$status" ]]; then
         printf "%s ; UNKNOWN\n" "$member"
@@ -126,7 +125,6 @@ get_gtm_pool_members_status() {
       continue
     fi
 
-    # fallback si libellé différent : "Pool Member:"
     if [[ -z "$member" && "$line" == *"Pool Member:"* ]]; then
       member="${line#*Pool Member:}"
       member="$(trim "$member")"
@@ -158,24 +156,41 @@ get_gtm_pool_members_status() {
 }
 
 #######################################
-# GTM Servers + iQuery
+# GTM Servers + iQuery  (✅ corrigé avec cd / + fallback)
 #######################################
 get_gtm_servers() {
-  tmsh -c "list gtm server recursive one-line" 2>/dev/null \
-  | awk '$1=="gtm" && $2=="server" {print $3}' \
-  | sed '/^$/d' | sort -u
+  local out=""
+
+  out="$(tmsh -c "cd /; list gtm server recursive one-line" 2>/dev/null \
+        | awk '$1=="gtm" && $2=="server" {print $3}' \
+        | sed 's/[{;]//g' || true)"
+
+  if [[ -z "${out:-}" ]]; then
+    out="$(tmsh -c "cd /; list gtm server one-line" 2>/dev/null \
+          | awk '$1=="gtm" && $2=="server" {print $3}' \
+          | sed 's/[{;]//g' || true)"
+  fi
+
+  if [[ -z "${out:-}" ]]; then
+    out="$(tmsh -c "cd /; list gtm server recursive" 2>/dev/null \
+          | awk '$1=="gtm" && $2=="server" {print $3}' \
+          | sed 's/[{;]//g' || true)"
+  fi
+
+  printf "%s\n" "$out" | sed '/^$/d' | sort -u
 }
 
 get_gtm_server_avail() {
   local S="$1"
-  tmsh -c "show gtm server ${S}" 2>/dev/null | first_availability_from_show
+  tmsh -c "cd /; show gtm server ${S}" 2>/dev/null | first_availability_from_show
 }
 
-# iQuery status par server: on tente d’extraire une ligne contenant "iQuery" + ":" (format variable)
+# iQuery par server: extraction tolérante depuis "show gtm server"
 get_gtm_server_iquery() {
   local S="$1"
   local out
-  out="$(tmsh -c "show gtm server ${S}" 2>/dev/null \
+
+  out="$(tmsh -c "cd /; show gtm server ${S}" 2>/dev/null \
         | awk '
             BEGIN{IGNORECASE=1}
             /iquery/ && /:/ {
@@ -185,19 +200,18 @@ get_gtm_server_iquery() {
               if (s!="") {print s; exit}
             }
           ' || true)"
+
   [[ -n "${out:-}" ]] && printf "%s" "$out" || printf "UNKNOWN"
 }
 
-# iQuery global (optionnel, dépend du TMOS): on sort un extrait utile
+# iQuery global (si dispo) : sortie compacte
 show_gtm_iquery_compact() {
   local RAW
-  RAW="$(tmsh -c "show gtm iquery" 2>/dev/null || true)"
+  RAW="$(tmsh -c "cd /; show gtm iquery" 2>/dev/null || true)"
   if [[ -z "${RAW:-}" ]]; then
     echo "(commande \"show gtm iquery\" indisponible ou sortie vide)"
     return 0
   fi
-
-  # extrait compact: lignes contenant iquery / server / status / availability / state
   printf "%s\n" "$RAW" | grep -Ei "iquery|server|availability|status|state" || true
 }
 
@@ -208,7 +222,7 @@ WIP_TOTAL=0; WIP_UP=0; WIP_DOWN=0; WIP_UNK=0
 GP_TOTAL=0;  GP_UP=0;  GP_DOWN=0;  GP_UNK=0
 GPM_TOTAL=0; GPM_UP=0; GPM_DOWN=0; GPM_UNK=0
 GS_TOTAL=0;  GS_UP=0;  GS_DOWN=0;  GS_UNK=0
-IQ_TOTAL=0;  IQ_UP=0;  IQ_DOWN=0;  IQ_UNK=0   # iQuery par server
+IQ_TOTAL=0;  IQ_UP=0;  IQ_DOWN=0;  IQ_UNK=0
 
 #######################################
 # DETAIL OUTPUT
@@ -311,7 +325,6 @@ else
       *) IQ_UNK=$((IQ_UNK+1)) ;;
     esac
 
-    # format compact
     printf "%s ; availability=%s ; iquery=%s\n" "$S" "$SAV" "$IQ"
   done <<< "$SERVERS"
 fi
