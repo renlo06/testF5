@@ -118,24 +118,33 @@ get_pool_members_status() {
   shopt -u nocasematch
 }
 
-# ---------- NODES (corrigé: sans cd, filtrage par partition) ----------
-get_node_list_partition() {
+# ---------- NODES (par partition, sans fullPath) ----------
+get_node_list() {
   local P="$1"
-  local part="/${P}/"
+  local out=""
 
-  tmsh -c "list ltm node recursive one-line" 2>/dev/null \
-  | awk -v part="$part" '
-      $1=="ltm" && $2=="node" {
-        n=$3
-        if (index(n, part)==1) print n
-      }' \
-  | sed '/^$/d' \
-  | sort -u
+  # 1) recursive one-line
+  out="$(tmsh -c "cd /${P}; list ltm node recursive one-line" 2>/dev/null \
+        | awk '$1=="ltm" && $2=="node" {print $3}' || true)"
+
+  # 2) one-line
+  if [[ -z "${out:-}" ]]; then
+    out="$(tmsh -c "cd /${P}; list ltm node one-line" 2>/dev/null \
+          | awk '$1=="ltm" && $2=="node" {print $3}' || true)"
+  fi
+
+  # 3) recursive (multiline)
+  if [[ -z "${out:-}" ]]; then
+    out="$(tmsh -c "cd /${P}; list ltm node recursive" 2>/dev/null \
+          | awk '$1=="ltm" && $2=="node" {print $3}' || true)"
+  fi
+
+  printf "%s\n" "$out" | sed '/^$/d' | sort -u
 }
 
 get_node_availability() {
-  local NODE="$1"
-  tmsh -c "show ltm node ${NODE}" 2>/dev/null | first_availability_from_show
+  local P="$1" NODE="$2"
+  tmsh -c "cd /${P}; show ltm node ${NODE}" 2>/dev/null | first_availability_from_show
 }
 
 # ---------- MAIN ----------
@@ -162,7 +171,6 @@ while IFS= read -r P || [[ -n "$P" ]]; do
       printf "%s ; %s\n" "$VS" "$AVAIL"
     done <<< "$VS_LIST"
   fi
-
   echo
 
   # Pools + Members
@@ -173,7 +181,6 @@ while IFS= read -r P || [[ -n "$P" ]]; do
   else
     while IFS= read -r POOL || [[ -n "$POOL" ]]; do
       [[ -z "$POOL" ]] && continue
-
       PAVAIL="$(get_pool_availability "$P" "$POOL")"
       printf "%s ; %s\n" "$POOL" "$PAVAIL"
 
@@ -195,22 +202,20 @@ while IFS= read -r P || [[ -n "$P" ]]; do
           done <<< "$MEMBERS"
         fi
       fi
-
       echo
     done <<< "$POOL_LIST"
   fi
-
   echo
 
-  # Nodes (par partition, filtrés)
+  # Nodes
   echo "-- Nodes"
-  NODE_LIST="$(get_node_list_partition "$P" || true)"
+  NODE_LIST="$(get_node_list "$P" || true)"
   if [[ -z "${NODE_LIST:-}" ]]; then
     echo "(0 Nodes visibles dans /$P)"
   else
     while IFS= read -r NODE || [[ -n "$NODE" ]]; do
       [[ -z "$NODE" ]] && continue
-      NAVAIL="$(get_node_availability "$NODE")"
+      NAVAIL="$(get_node_availability "$P" "$NODE")"
       printf "%s ; %s\n" "$NODE" "$NAVAIL"
     done <<< "$NODE_LIST"
   fi
