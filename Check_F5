@@ -46,6 +46,17 @@ get_partitions() {
   | sort -u
 }
 
+# ---------- ASM POLICIES ----------
+# On liste globalement (ASM policies ne se gèrent pas toujours "par partition" comme LTM)
+get_asm_policies() {
+  tmsh -c "list asm policy recursive" 2>/dev/null \
+  | awk '
+      $1=="asm" && $2=="policy" {print $3}
+    ' \
+  | sed '/^$/d' \
+  | sort -u
+}
+
 # ---------- VS ----------
 get_vs_list() {
   local P="$1"
@@ -70,7 +81,6 @@ get_pool_availability() {
   tmsh -c "cd /${P}; show ltm pool ${POOL}" 2>/dev/null | first_availability_from_show
 }
 
-# Members parser ROBUST (tolérant + fallback)
 get_pool_members_status() {
   local P="$1" POOL="$2"
   local line member="" status="" val=""
@@ -118,22 +128,19 @@ get_pool_members_status() {
   shopt -u nocasematch
 }
 
-# ---------- NODES (par partition, sans fullPath) ----------
+# ---------- NODES (par partition) ----------
 get_node_list() {
   local P="$1"
   local out=""
 
-  # 1) recursive one-line
   out="$(tmsh -c "cd /${P}; list ltm node recursive one-line" 2>/dev/null \
         | awk '$1=="ltm" && $2=="node" {print $3}' || true)"
 
-  # 2) one-line
   if [[ -z "${out:-}" ]]; then
     out="$(tmsh -c "cd /${P}; list ltm node one-line" 2>/dev/null \
           | awk '$1=="ltm" && $2=="node" {print $3}' || true)"
   fi
 
-  # 3) recursive (multiline)
   if [[ -z "${out:-}" ]]; then
     out="$(tmsh -c "cd /${P}; list ltm node recursive" 2>/dev/null \
           | awk '$1=="ltm" && $2=="node" {print $3}' || true)"
@@ -148,6 +155,15 @@ get_node_availability() {
 }
 
 # ---------- MAIN ----------
+echo "===== ASM Policies ====="
+ASM_LIST="$(get_asm_policies || true)"
+if [[ -z "${ASM_LIST:-}" ]]; then
+  echo "(0 ASM policies visibles ou module ASM non accessible)"
+else
+  printf "%s\n" "$ASM_LIST"
+fi
+echo
+
 PARTS="$(get_partitions || true)"
 if [[ -z "${PARTS:-}" ]]; then
   echo "❌ Aucune partition visible (droits insuffisants ?) ou sortie vide."
@@ -159,7 +175,6 @@ while IFS= read -r P || [[ -n "$P" ]]; do
 
   echo "===== /$P ====="
 
-  # VS
   echo "-- Virtual Servers"
   VS_LIST="$(get_vs_list "$P" || true)"
   if [[ -z "${VS_LIST:-}" ]]; then
@@ -173,7 +188,6 @@ while IFS= read -r P || [[ -n "$P" ]]; do
   fi
   echo
 
-  # Pools + Members
   echo "-- Pools"
   POOL_LIST="$(get_pool_list "$P" || true)"
   if [[ -z "${POOL_LIST:-}" ]]; then
@@ -207,7 +221,6 @@ while IFS= read -r P || [[ -n "$P" ]]; do
   fi
   echo
 
-  # Nodes
   echo "-- Nodes"
   NODE_LIST="$(get_node_list "$P" || true)"
   if [[ -z "${NODE_LIST:-}" ]]; then
