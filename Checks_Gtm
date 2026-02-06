@@ -1,0 +1,400 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+#######################################
+# CONFIG
+#######################################
+DEVICES_FILE="devices.txt"          # 1 host par ligne
+BASE_DIR="./checks"
+TS=$(date +%Y%m%d-%H%M%S)
+
+#######################################
+# PRECHECKS
+#######################################
+for bin in ssh sshpass awk sed sort date mkdir wc tr; do
+  command -v "$bin" >/dev/null || { echo "❌ $bin requis"; exit 1; }
+done
+
+[[ -f "$DEVICES_FILE" ]] || { echo "❌ Fichier équipements introuvable : $DEVICES_FILE"; exit 1; }
+
+#######################################
+# INPUTS
+#######################################
+read -rp "Utilisateur SSH (compte qui arrive en tmsh): " SSH_USER
+read -s -rp "Mot de passe SSH: " SSH_PASS
+echo
+
+RUN_DIR="${BASE_DIR}/${TS}"
+mkdir -p "$RUN_DIR"
+
+echo "📁 Répertoire run : $RUN_DIR"
+echo
+
+#######################################
+# REMOTE SCRIPT (stdout)
+# Marker ###SUMMARY### splits detail vs summary
+#######################################
+REMOTE_BASH=$(cat <<'RB'
+set -euo pipefail
+
+trim() {
+  local s="$1"
+  s="${s#"${s%%[![:space:]]*}"}"
+  s="${s%"${s##*[![:space:]]}"}"
+  printf "%s" "$s"
+}
+
+# Normalise un statut F5 -> UP/DOWN/UNKNOWN
+norm_status() {
+  local s="${1:-UNKNOWN}"
+  s="$(trim "$s")"
+  s="$(printf "%s" "$s" | tr '[:lower:]' '[:upper:]')"
+
+  if [[ "$s" == *"AVAILABLE"* || "$s" == *"UP"* || "$s" == *"GREEN"* ]]; then
+    echo "UP"; return 0
+  fi
+  if [[ "$s" == *"OFFLINE"* || "$s" == *"DOWN"* || "$s" == *"RED"* || "$s" == *"UNAVAILABLE"* ]]; then
+    echo "DOWN"; return 0
+  fi
+  echo "UNKNOWN"
+}
+
+# lit stdin d'un "show ..." et retourne la 1ère valeur après "Availability :"
+first_availability_from_show() {
+  local line val
+  while IFS= read -r line; do
+    case "$line" in
+      *Availability*:* )
+        val="${line#*:}"
+        val="$(trim "$val")"
+        [[ -n "$val" ]] && { printf "%s" "$val"; return 0; }
+        ;;
+    esac
+  done
+  printf "UNKNOWN"
+}
+
+#######################################
+# GTM WideIP
+#######################################
+# Retourne lignes: "type ; name"
+get_wideips() {
+  tmsh -c "list gtm wideip recursive one-line" 2>/dev/null \
+  | awk '$1=="gtm" && $2=="wideip" {print $3 " ; " $4}' \
+  | sed '/^$/d' | sort -u
+}
+
+get_wideip_avail() {
+  local TYPE="$1" NAME="$2"
+  tmsh -c "show gtm wideip ${TYPE} ${NAME}" 2>/dev/null | first_availability_from_show
+}
+
+#######################################
+# GTM Pools
+#######################################
+# Retourne lignes: "type ; name"
+get_gtm_pools() {
+  tmsh -c "list gtm pool recursive one-line" 2>/dev/null \
+  | awk '$1=="gtm" && $2=="pool" {print $3 " ; " $4}' \
+  | sed '/^$/d' | sort -u
+}
+
+get_gtm_pool_avail() {
+  local TYPE="$1" NAME="$2"
+  tmsh -c "show gtm pool ${TYPE} ${NAME}" 2>/dev/null | first_availability_from_show
+}
+
+# Members parser (tolérant) pour GTM pool
+# Retourne: "member ; status"
+get_gtm_pool_members_status() {
+  local TYPE="$1" NAME="$2"
+  local line member="" status="" val=""
+
+  shopt -s nocasematch
+  local RAW
+  RAW="$(tmsh -c "show gtm pool ${TYPE} ${NAME} members" 2>/dev/null || true)"
+
+  while IFS= read -r line; do
+    # Beaucoup de sorties F5 utilisent "GTM::Pool Member:"
+    if [[ "$line" == *"GTM::Pool Member:"* ]]; then
+      if [[ -n "$member" && -z "$status" ]]; then
+        printf "%s ; UNKNOWN\n" "$member"
+      fi
+      member="${line#*GTM::Pool Member:}"
+      member="$(trim "$member")"
+      status=""
+      continue
+    fi
+
+    # fallback si libellé différent : "Pool Member:"
+    if [[ -z "$member" && "$line" == *"Pool Member:"* ]]; then
+      member="${line#*Pool Member:}"
+      member="$(trim "$member")"
+      status=""
+      continue
+    fi
+
+    if [[ -n "$member" ]]; then
+      if [[ "$line" == *"Availability"*:* ]]; then
+        val="${line#*:}"; val="$(trim "$val")"; status="${val:-UNKNOWN}"
+      elif [[ "$line" == *"State"*:* && -z "$status" ]]; then
+        val="${line#*:}"; val="$(trim "$val")"; status="${val:-UNKNOWN}"
+      elif [[ "$line" == *"Session"*:* && -z "$status" ]]; then
+        val="${line#*:}"; val="$(trim "$val")"; status="${val:-UNKNOWN}"
+      fi
+
+      if [[ -n "$status" ]]; then
+        printf "%s ; %s\n" "$member" "$status"
+        member=""; status=""
+      fi
+    fi
+  done <<< "$RAW"
+
+  if [[ -n "$member" && -z "$status" ]]; then
+    printf "%s ; UNKNOWN\n" "$member"
+  fi
+
+  shopt -u nocasematch
+}
+
+#######################################
+# GTM Servers + iQuery
+#######################################
+get_gtm_servers() {
+  tmsh -c "list gtm server recursive one-line" 2>/dev/null \
+  | awk '$1=="gtm" && $2=="server" {print $3}' \
+  | sed '/^$/d' | sort -u
+}
+
+get_gtm_server_avail() {
+  local S="$1"
+  tmsh -c "show gtm server ${S}" 2>/dev/null | first_availability_from_show
+}
+
+# iQuery status par server: on tente d’extraire une ligne contenant "iQuery" + ":" (format variable)
+get_gtm_server_iquery() {
+  local S="$1"
+  local out
+  out="$(tmsh -c "show gtm server ${S}" 2>/dev/null \
+        | awk '
+            BEGIN{IGNORECASE=1}
+            /iquery/ && /:/ {
+              s=$0
+              sub(/^.*iquery[^:]*:/,"",s)
+              gsub(/^[ \t]+|[ \t]+$/,"",s)
+              if (s!="") {print s; exit}
+            }
+          ' || true)"
+  [[ -n "${out:-}" ]] && printf "%s" "$out" || printf "UNKNOWN"
+}
+
+# iQuery global (optionnel, dépend du TMOS): on sort un extrait utile
+show_gtm_iquery_compact() {
+  local RAW
+  RAW="$(tmsh -c "show gtm iquery" 2>/dev/null || true)"
+  if [[ -z "${RAW:-}" ]]; then
+    echo "(commande \"show gtm iquery\" indisponible ou sortie vide)"
+    return 0
+  fi
+
+  # extrait compact: lignes contenant iquery / server / status / availability / state
+  printf "%s\n" "$RAW" | grep -Ei "iquery|server|availability|status|state" || true
+}
+
+#######################################
+# COUNTERS
+#######################################
+WIP_TOTAL=0; WIP_UP=0; WIP_DOWN=0; WIP_UNK=0
+GP_TOTAL=0;  GP_UP=0;  GP_DOWN=0;  GP_UNK=0
+GPM_TOTAL=0; GPM_UP=0; GPM_DOWN=0; GPM_UNK=0
+GS_TOTAL=0;  GS_UP=0;  GS_DOWN=0;  GS_UNK=0
+IQ_TOTAL=0;  IQ_UP=0;  IQ_DOWN=0;  IQ_UNK=0   # iQuery par server
+
+#######################################
+# DETAIL OUTPUT
+#######################################
+echo "########################################"
+echo "BIG-IP CHECK (GTM)"
+echo "Date : $(date)"
+echo "########################################"
+echo
+
+echo "===== WIDEIP ====="
+WIPS="$(get_wideips || true)"
+if [[ -z "${WIPS:-}" ]]; then
+  echo "(0 WideIP)"
+else
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    [[ -z "$line" ]] && continue
+    TYPE="$(trim "${line%%;*}")"
+    NAME="$(trim "${line#*;}" )"
+
+    AV="$(get_wideip_avail "$TYPE" "$NAME")"
+    ST="$(norm_status "$AV")"
+    WIP_TOTAL=$((WIP_TOTAL+1))
+    case "$ST" in
+      UP) WIP_UP=$((WIP_UP+1)) ;;
+      DOWN) WIP_DOWN=$((WIP_DOWN+1)) ;;
+      *) WIP_UNK=$((WIP_UNK+1)) ;;
+    esac
+
+    printf "%s ; %s ; %s\n" "$TYPE" "$NAME" "$AV"
+  done <<< "$WIPS"
+fi
+echo
+
+echo "===== GTM POOLS ====="
+POOLS="$(get_gtm_pools || true)"
+if [[ -z "${POOLS:-}" ]]; then
+  echo "(0 GTM Pools)"
+else
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    [[ -z "$line" ]] && continue
+    TYPE="$(trim "${line%%;*}")"
+    NAME="$(trim "${line#*;}" )"
+
+    PAV="$(get_gtm_pool_avail "$TYPE" "$NAME")"
+    PST="$(norm_status "$PAV")"
+    GP_TOTAL=$((GP_TOTAL+1))
+    case "$PST" in
+      UP) GP_UP=$((GP_UP+1)) ;;
+      DOWN) GP_DOWN=$((GP_DOWN+1)) ;;
+      *) GP_UNK=$((GP_UNK+1)) ;;
+    esac
+
+    printf "%s ; %s ; %s\n" "$TYPE" "$NAME" "$PAV"
+
+    MEMBERS="$(get_gtm_pool_members_status "$TYPE" "$NAME" || true)"
+    if [[ -z "${MEMBERS:-}" ]]; then
+      echo "  (0 members ou statut non lisible)"
+    else
+      while IFS= read -r m || [[ -n "$m" ]]; do
+        [[ -z "$m" ]] && continue
+        printf "  %s\n" "$m"
+
+        ms="$(trim "${m#*;}" )"
+        mst="$(norm_status "$ms")"
+        GPM_TOTAL=$((GPM_TOTAL+1))
+        case "$mst" in
+          UP) GPM_UP=$((GPM_UP+1)) ;;
+          DOWN) GPM_DOWN=$((GPM_DOWN+1)) ;;
+          *) GPM_UNK=$((GPM_UNK+1)) ;;
+        esac
+      done <<< "$MEMBERS"
+    fi
+    echo
+  done <<< "$POOLS"
+fi
+
+echo "===== GTM SERVERS ====="
+SERVERS="$(get_gtm_servers || true)"
+if [[ -z "${SERVERS:-}" ]]; then
+  echo "(0 GTM Servers)"
+else
+  while IFS= read -r S || [[ -n "$S" ]]; do
+    [[ -z "$S" ]] && continue
+    SAV="$(get_gtm_server_avail "$S")"
+    SST="$(norm_status "$SAV")"
+    GS_TOTAL=$((GS_TOTAL+1))
+    case "$SST" in
+      UP) GS_UP=$((GS_UP+1)) ;;
+      DOWN) GS_DOWN=$((GS_DOWN+1)) ;;
+      *) GS_UNK=$((GS_UNK+1)) ;;
+    esac
+
+    IQ="$(get_gtm_server_iquery "$S")"
+    IQST="$(norm_status "$IQ")"
+    IQ_TOTAL=$((IQ_TOTAL+1))
+    case "$IQST" in
+      UP) IQ_UP=$((IQ_UP+1)) ;;
+      DOWN) IQ_DOWN=$((IQ_DOWN+1)) ;;
+      *) IQ_UNK=$((IQ_UNK+1)) ;;
+    esac
+
+    # format compact
+    printf "%s ; availability=%s ; iquery=%s\n" "$S" "$SAV" "$IQ"
+  done <<< "$SERVERS"
+fi
+echo
+
+echo "===== GTM IQUERY (global) ====="
+show_gtm_iquery_compact || true
+echo
+
+#######################################
+# SUMMARY OUTPUT (marker)
+#######################################
+echo "###SUMMARY###"
+echo "Run date: $(date)"
+echo
+echo "[WIDEIP]"
+echo "Total: ${WIP_TOTAL} | UP: ${WIP_UP} | DOWN: ${WIP_DOWN} | UNKNOWN: ${WIP_UNK}"
+echo
+echo "[GTM POOLS]"
+echo "Pools total: ${GP_TOTAL} | UP: ${GP_UP} | DOWN: ${GP_DOWN} | UNKNOWN: ${GP_UNK}"
+echo "Pool members total: ${GPM_TOTAL} | UP: ${GPM_UP} | DOWN: ${GPM_DOWN} | UNKNOWN: ${GPM_UNK}"
+echo
+echo "[GTM SERVERS]"
+echo "Servers total: ${GS_TOTAL} | UP: ${GS_UP} | DOWN: ${GS_DOWN} | UNKNOWN: ${GS_UNK}"
+echo "iQuery (per server) total: ${IQ_TOTAL} | UP: ${IQ_UP} | DOWN: ${IQ_DOWN} | UNKNOWN: ${IQ_UNK}"
+RB
+)
+
+#######################################
+# MAIN LOOP (multi devices)
+#######################################
+TOTAL=$(grep -Ev '^\s*#|^\s*$' "$DEVICES_FILE" | wc -l | awk '{print $1}')
+COUNT=0
+FAIL=0
+
+echo "📋 Multi-équipements (GTM)"
+echo "📄 Devices file : $DEVICES_FILE"
+echo "🔢 Total        : $TOTAL"
+echo "📅 Run TS       : $TS"
+echo
+
+while IFS= read -r LINE || [[ -n "$LINE" ]]; do
+  HOST=$(printf "%s" "$LINE" | tr -d '\r' | xargs)
+  [[ -z "$HOST" || "$HOST" =~ ^# ]] && continue
+
+  COUNT=$((COUNT+1))
+  HOST_DIR="${RUN_DIR}/${HOST}"
+  mkdir -p "$HOST_DIR"
+
+  DETAIL_FILE="${HOST_DIR}/check_GTM_WIDEIP_POOLS_SERVERS_IQUERY.txt"
+  SUMMARY_FILE="${HOST_DIR}/summary_GTM_WIDEIP_POOLS_SERVERS_IQUERY.txt"
+
+  echo "======================================"
+  echo "➡️  [$COUNT/$TOTAL] BIG-IP : $HOST"
+  echo "   Détail  : $DETAIL_FILE"
+  echo "   Synthèse: $SUMMARY_FILE"
+  echo "======================================"
+
+  if sshpass -p "$SSH_PASS" ssh -T \
+      -o StrictHostKeyChecking=no \
+      -o ConnectTimeout=15 \
+      -o LogLevel=Error \
+      "${SSH_USER}@${HOST}" "run util bash -s" \
+      <<< "$REMOTE_BASH" \
+      | awk -v OUT="$DETAIL_FILE" -v SUM="$SUMMARY_FILE" '
+          BEGIN{mode=0}
+          $0=="###SUMMARY###"{mode=1; next}
+          mode==0{print >> OUT; next}
+          mode==1{print >> SUM; next}
+        '; then
+    echo "✅ Terminé : $HOST"
+  else
+    echo "❌ Échec : $HOST"
+    FAIL=$((FAIL+1))
+  fi
+
+  echo
+done < "$DEVICES_FILE"
+
+echo "======================================"
+echo "🏁 Terminé"
+echo "📁 Run dir : $RUN_DIR"
+echo "❌ Échecs  : $FAIL"
+echo "======================================"
+
+(( FAIL == 0 )) || exit 1
