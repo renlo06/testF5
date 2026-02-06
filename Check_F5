@@ -70,7 +70,7 @@ get_pool_availability() {
   tmsh -c "cd /${P}; show ltm pool ${POOL}" 2>/dev/null | first_availability_from_show
 }
 
-# ✅ Members parser ROBUST (tolérant + fallback)
+# Members parser ROBUST (tolérant + fallback)
 get_pool_members_status() {
   local P="$1" POOL="$2"
   local line member="" status="" val=""
@@ -118,13 +118,24 @@ get_pool_members_status() {
     printf "%s ; UNKNOWN\n" "$member"
   fi
 
-  # Fallback si rien ne ressemble à un bloc member
   if ! grep -qi "LTM::Pool Member:" <<< "$RAW"; then
     echo "__FALLBACK__"
     printf "%s\n" "$RAW" | grep -Ei "Pool Member|Availability|State|Session" || true
   fi
 
   shopt -u nocasematch
+}
+
+# ---------- NODES ----------
+get_node_list() {
+  local P="$1"
+  tmsh -c "cd /${P}; list ltm node recursive one-line" 2>/dev/null \
+  | awk '$1=="ltm" && $2=="node" {print $3}'
+}
+
+get_node_availability() {
+  local P="$1" NODE="$2"
+  tmsh -c "cd /${P}; show ltm node ${NODE}" 2>/dev/null | first_availability_from_show
 }
 
 # ---------- MAIN ----------
@@ -187,6 +198,21 @@ while IFS= read -r P || [[ -n "$P" ]]; do
 
       echo
     done <<< "$POOL_LIST"
+  fi
+
+  echo
+
+  # Nodes
+  echo "-- Nodes"
+  NODE_LIST="$(get_node_list "$P" || true)"
+  if [[ -z "${NODE_LIST:-}" ]]; then
+    echo "(0 Nodes visibles dans /$P)"
+  else
+    while IFS= read -r NODE || [[ -n "$NODE" ]]; do
+      [[ -z "$NODE" ]] && continue
+      NAVAIL="$(get_node_availability "$P" "$NODE")"
+      printf "%s ; %s\n" "$NODE" "$NAVAIL"
+    done <<< "$NODE_LIST"
   fi
 
   echo
