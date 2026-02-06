@@ -39,26 +39,11 @@ first_availability_from_show() {
   return 0
 }
 
-# ---------- NODES (filtrés par partition, sans cd) ----------
-get_node_list_partition() {
-  local P="$1"
-
-  tmsh -c "list ltm node recursive one-line" 2>/dev/null \
-  | awk -v part="/${P}/" '
-      $1=="ltm" && $2=="node" {
-        node=$3
-        # si fullPath commence par /Partition/
-        if (index(node, part)==1 || node==substr(part,2)) {
-          print node
-        }
-      }' \
+get_partitions() {
+  tmsh -c "list auth partition one-line" \
+  | awk '$1=="auth" && $2=="partition" {print $3}' \
   | sed '/^$/d' \
   | sort -u
-}
-
-get_node_availability_partition() {
-  local NODE="$1"
-  tmsh -c "show ltm node ${NODE}" 2>/dev/null | first_availability_from_show
 }
 
 # ---------- VS ----------
@@ -85,6 +70,7 @@ get_pool_availability() {
   tmsh -c "cd /${P}; show ltm pool ${POOL}" 2>/dev/null | first_availability_from_show
 }
 
+# Members parser ROBUST (tolérant + fallback)
 get_pool_members_status() {
   local P="$1" POOL="$2"
   local line member="" status="" val=""
@@ -132,14 +118,22 @@ get_pool_members_status() {
   shopt -u nocasematch
 }
 
-# ---------- NODES (GLOBAL) ----------
-get_node_list_global() {
-  # Pas de cd => on récupère ce que l’utilisateur est autorisé à voir, souvent /Common + sous-folders
+# ---------- NODES (corrigé: sans cd, filtrage par partition) ----------
+get_node_list_partition() {
+  local P="$1"
+  local part="/${P}/"
+
   tmsh -c "list ltm node recursive one-line" 2>/dev/null \
-  | awk '$1=="ltm" && $2=="node" {print $3}'
+  | awk -v part="$part" '
+      $1=="ltm" && $2=="node" {
+        n=$3
+        if (index(n, part)==1) print n
+      }' \
+  | sed '/^$/d' \
+  | sort -u
 }
 
-get_node_availability_global() {
+get_node_availability() {
   local NODE="$1"
   tmsh -c "show ltm node ${NODE}" 2>/dev/null | first_availability_from_show
 }
@@ -151,12 +145,12 @@ if [[ -z "${PARTS:-}" ]]; then
   exit 1
 fi
 
-# VS + Pools par partition
 while IFS= read -r P || [[ -n "$P" ]]; do
   [[ -z "$P" ]] && continue
 
   echo "===== /$P ====="
 
+  # VS
   echo "-- Virtual Servers"
   VS_LIST="$(get_vs_list "$P" || true)"
   if [[ -z "${VS_LIST:-}" ]]; then
@@ -170,6 +164,8 @@ while IFS= read -r P || [[ -n "$P" ]]; do
   fi
 
   echo
+
+  # Pools + Members
   echo "-- Pools"
   POOL_LIST="$(get_pool_list "$P" || true)"
   if [[ -z "${POOL_LIST:-}" ]]; then
@@ -199,26 +195,26 @@ while IFS= read -r P || [[ -n "$P" ]]; do
           done <<< "$MEMBERS"
         fi
       fi
+
       echo
     done <<< "$POOL_LIST"
   fi
 
   echo
+
+  # Nodes (par partition, filtrés)
+  echo "-- Nodes"
+  NODE_LIST="$(get_node_list_partition "$P" || true)"
+  if [[ -z "${NODE_LIST:-}" ]]; then
+    echo "(0 Nodes visibles dans /$P)"
+  else
+    while IFS= read -r NODE || [[ -n "$NODE" ]]; do
+      [[ -z "$NODE" ]] && continue
+      NAVAIL="$(get_node_availability "$NODE")"
+      printf "%s ; %s\n" "$NODE" "$NAVAIL"
+    done <<< "$NODE_LIST"
+  fi
+
+  echo
 done <<< "$PARTS"
-
-# Nodes en global (une seule fois)
-echo "-- Nodes"
-NODE_LIST="$(get_node_list_partition "$P" || true)"
-
-if [[ -z "${NODE_LIST:-}" ]]; then
-  echo "(0 Nodes visibles dans /$P)"
-else
-  while IFS= read -r NODE || [[ -n "$NODE" ]]; do
-    [[ -z "$NODE" ]] && continue
-    NAVAIL="$(get_node_availability_partition "$NODE")"
-    printf "%s ; %s\n" "$NODE" "$NAVAIL"
-  done <<< "$NODE_LIST"
-fi
-
-echo
 REMOTE_BASH
