@@ -1,7 +1,13 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-for bin in ssh sshpass awk sed sort; do
+#######################################
+# CONFIG
+#######################################
+BASE_DIR="./checks"
+TS=$(date +%Y%m%d-%H%M%S)
+
+for bin in ssh sshpass awk sed sort date mkdir; do
   command -v "$bin" >/dev/null || { echo "❌ $bin requis"; exit 1; }
 done
 
@@ -10,11 +16,26 @@ read -rp "Utilisateur SSH (compte qui arrive en tmsh): " SSH_USER
 read -s -rp "Mot de passe SSH: " SSH_PASS
 echo
 
+#######################################
+# DIRECTORY STRUCTURE
+#######################################
+HOST_DIR="${BASE_DIR}/${TS}/${HOST}"
+mkdir -p "$HOST_DIR"
+
+OUTPUT_FILE="${HOST_DIR}/check_LTM_ASM_AFM.txt"
+
+echo "📁 Résultat stocké dans : $OUTPUT_FILE"
+echo
+
+#######################################
+# REMOTE EXECUTION
+#######################################
 sshpass -p "$SSH_PASS" ssh -T \
   -o StrictHostKeyChecking=no \
   -o ConnectTimeout=15 \
   -o LogLevel=Error \
-  "${SSH_USER}@${HOST}" "run util bash -s" <<'REMOTE_BASH'
+  "${SSH_USER}@${HOST}" "run util bash -s" <<'REMOTE_BASH' > "$OUTPUT_FILE"
+
 set -euo pipefail
 
 trim() {
@@ -36,255 +57,53 @@ first_availability_from_show() {
     esac
   done
   printf "UNKNOWN"
-  return 0
 }
 
-get_partitions() {
-  tmsh -c "list auth partition one-line" \
-  | awk '$1=="auth" && $2=="partition" {print $3}' \
-  | sed '/^$/d' \
-  | sort -u
-}
-
-# ---------- ASM POLICIES ----------
-get_asm_policies() {
-  tmsh -c "list asm policy recursive" 2>/dev/null \
-  | awk '$1=="asm" && $2=="policy" {print $3}' \
-  | sed '/^$/d' \
-  | sort -u
-}
-
-# ---------- AFM POLICIES ----------
-# Firewall policies
-get_afm_fw_policies() {
-  tmsh -c "list security firewall policy recursive" 2>/dev/null \
-  | awk '$1=="security" && $2=="firewall" && $3=="policy" {print $4}' \
-  | sed '/^$/d' \
-  | sort -u
-}
-
-# NAT policies (si utilisées)
-get_afm_nat_policies() {
-  tmsh -c "list security nat policy recursive" 2>/dev/null \
-  | awk '$1=="security" && $2=="nat" && $3=="policy" {print $4}' \
-  | sed '/^$/d' \
-  | sort -u
-}
-
-# Protocol Security policies (si utilisées)
-get_afm_protocol_security_policies() {
-  tmsh -c "list security protocol-security policy recursive" 2>/dev/null \
-  | awk '$1=="security" && $2=="protocol-security" && $3=="policy" {print $4}' \
-  | sed '/^$/d' \
-  | sort -u
-}
-
-# ---------- VS ----------
-get_vs_list() {
-  local P="$1"
-  tmsh -c "cd /${P}; list ltm virtual recursive one-line" 2>/dev/null \
-  | awk '$1=="ltm" && $2=="virtual" {print $3}'
-}
-
-get_vs_availability() {
-  local P="$1" VS="$2"
-  tmsh -c "cd /${P}; show ltm virtual ${VS}" 2>/dev/null | first_availability_from_show
-}
-
-# ---------- POOLS ----------
-get_pool_list() {
-  local P="$1"
-  tmsh -c "cd /${P}; list ltm pool recursive one-line" 2>/dev/null \
-  | awk '$1=="ltm" && $2=="pool" {print $3}'
-}
-
-get_pool_availability() {
-  local P="$1" POOL="$2"
-  tmsh -c "cd /${P}; show ltm pool ${POOL}" 2>/dev/null | first_availability_from_show
-}
-
-get_pool_members_status() {
-  local P="$1" POOL="$2"
-  local line member="" status="" val=""
-
-  shopt -s nocasematch
-  local RAW
-  RAW="$(tmsh -c "cd /${P}; show ltm pool ${POOL} members" 2>/dev/null || true)"
-
-  while IFS= read -r line; do
-    if [[ "$line" == *"LTM::Pool Member:"* ]]; then
-      if [[ -n "$member" && -z "$status" ]]; then
-        printf "%s ; UNKNOWN\n" "$member"
-      fi
-      member="${line#*LTM::Pool Member:}"
-      member="$(trim "$member")"
-      status=""
-      continue
-    fi
-
-    if [[ -n "$member" ]]; then
-      if [[ "$line" == *"Availability"*:* ]]; then
-        val="${line#*:}"; val="$(trim "$val")"; status="${val:-UNKNOWN}"
-      elif [[ "$line" == *"State"*:* && -z "$status" ]]; then
-        val="${line#*:}"; val="$(trim "$val")"; status="${val:-UNKNOWN}"
-      elif [[ "$line" == *"Session"*:* && -z "$status" ]]; then
-        val="${line#*:}"; val="$(trim "$val")"; status="${val:-UNKNOWN}"
-      fi
-
-      if [[ -n "$status" ]]; then
-        printf "%s ; %s\n" "$member" "$status"
-        member=""; status=""
-      fi
-    fi
-  done <<< "$RAW"
-
-  if [[ -n "$member" && -z "$status" ]]; then
-    printf "%s ; UNKNOWN\n" "$member"
-  fi
-
-  if ! grep -qi "LTM::Pool Member:" <<< "$RAW"; then
-    echo "__FALLBACK__"
-    printf "%s\n" "$RAW" | grep -Ei "Pool Member|Availability|State|Session" || true
-  fi
-
-  shopt -u nocasematch
-}
-
-# ---------- NODES (par partition) ----------
-get_node_list() {
-  local P="$1"
-  local out=""
-
-  out="$(tmsh -c "cd /${P}; list ltm node recursive one-line" 2>/dev/null \
-        | awk '$1=="ltm" && $2=="node" {print $3}' || true)"
-
-  if [[ -z "${out:-}" ]]; then
-    out="$(tmsh -c "cd /${P}; list ltm node one-line" 2>/dev/null \
-          | awk '$1=="ltm" && $2=="node" {print $3}' || true)"
-  fi
-
-  if [[ -z "${out:-}" ]]; then
-    out="$(tmsh -c "cd /${P}; list ltm node recursive" 2>/dev/null \
-          | awk '$1=="ltm" && $2=="node" {print $3}' || true)"
-  fi
-
-  printf "%s\n" "$out" | sed '/^$/d' | sort -u
-}
-
-get_node_availability() {
-  local P="$1" NODE="$2"
-  tmsh -c "cd /${P}; show ltm node ${NODE}" 2>/dev/null | first_availability_from_show
-}
-
-# ---------- MAIN (POLICIES) ----------
-echo "===== ASM Policies ====="
-ASM_LIST="$(get_asm_policies || true)"
-if [[ -z "${ASM_LIST:-}" ]]; then
-  echo "(0 ASM policies visibles ou module ASM non accessible)"
-else
-  printf "%s\n" "$ASM_LIST"
-fi
+echo "########################################"
+echo "BIG-IP CHECK"
+echo "Date : $(date)"
+echo "########################################"
 echo
 
-echo "===== AFM Policies ====="
-echo "-- Firewall policies"
-FW_LIST="$(get_afm_fw_policies || true)"
-if [[ -z "${FW_LIST:-}" ]]; then
-  echo "(0 firewall policies visibles ou module AFM non accessible)"
-else
-  printf "%s\n" "$FW_LIST"
-fi
+########################################
+# ASM
+########################################
+echo "===== ASM POLICIES ====="
+tmsh -c "list asm policy recursive" 2>/dev/null | grep "asm policy" || echo "Aucune policy ASM"
 echo
 
-echo "-- NAT policies"
-NAT_LIST="$(get_afm_nat_policies || true)"
-if [[ -z "${NAT_LIST:-}" ]]; then
-  echo "(0 nat policies visibles ou non utilisées)"
-else
-  printf "%s\n" "$NAT_LIST"
-fi
+########################################
+# AFM
+########################################
+echo "===== AFM FIREWALL POLICIES ====="
+tmsh -c "list security firewall policy recursive" 2>/dev/null | grep "policy" || echo "Aucune policy AFM"
 echo
 
-echo "-- Protocol Security policies"
-PS_LIST="$(get_afm_protocol_security_policies || true)"
-if [[ -z "${PS_LIST:-}" ]]; then
-  echo "(0 protocol-security policies visibles ou non utilisées)"
-else
-  printf "%s\n" "$PS_LIST"
-fi
-echo
+########################################
+# LTM (ALL PARTITIONS)
+########################################
+PARTS=$(tmsh -c "list auth partition one-line" | awk '$1=="auth"{print $3}')
 
-# ---------- MAIN (LTM by partition) ----------
-PARTS="$(get_partitions || true)"
-if [[ -z "${PARTS:-}" ]]; then
-  echo "❌ Aucune partition visible (droits insuffisants ?) ou sortie vide."
-  exit 1
-fi
-
-while IFS= read -r P || [[ -n "$P" ]]; do
-  [[ -z "$P" ]] && continue
-
-  echo "===== /$P ====="
+for P in $PARTS; do
+  echo "====================================="
+  echo "PARTITION : /$P"
+  echo "====================================="
+  echo
 
   echo "-- Virtual Servers"
-  VS_LIST="$(get_vs_list "$P" || true)"
-  if [[ -z "${VS_LIST:-}" ]]; then
-    echo "(0 VS visibles dans /$P)"
-  else
-    while IFS= read -r VS || [[ -n "$VS" ]]; do
-      [[ -z "$VS" ]] && continue
-      AVAIL="$(get_vs_availability "$P" "$VS")"
-      printf "%s ; %s\n" "$VS" "$AVAIL"
-    done <<< "$VS_LIST"
-  fi
+  tmsh -c "cd /${P}; list ltm virtual recursive one-line" 2>/dev/null || true
   echo
 
   echo "-- Pools"
-  POOL_LIST="$(get_pool_list "$P" || true)"
-  if [[ -z "${POOL_LIST:-}" ]]; then
-    echo "(0 Pools visibles dans /$P)"
-  else
-    while IFS= read -r POOL || [[ -n "$POOL" ]]; do
-      [[ -z "$POOL" ]] && continue
-      PAVAIL="$(get_pool_availability "$P" "$POOL")"
-      printf "%s ; %s\n" "$POOL" "$PAVAIL"
-
-      MEMBERS="$(get_pool_members_status "$P" "$POOL" || true)"
-      if [[ -z "${MEMBERS:-}" ]]; then
-        echo "  (0 members ou statut non lisible)"
-      else
-        if grep -q "^__FALLBACK__$" <<< "$MEMBERS"; then
-          echo "  (format members différent — extrait brut ci-dessous)"
-          while IFS= read -r l || [[ -n "$l" ]]; do
-            [[ "$l" == "__FALLBACK__" ]] && continue
-            [[ -z "$l" ]] && continue
-            printf "  %s\n" "$l"
-          done <<< "$MEMBERS"
-        else
-          while IFS= read -r l || [[ -n "$l" ]]; do
-            [[ -z "$l" ]] && continue
-            printf "  %s\n" "$l"
-          done <<< "$MEMBERS"
-        fi
-      fi
-
-      echo
-    done <<< "$POOL_LIST"
-  fi
+  tmsh -c "cd /${P}; list ltm pool recursive one-line" 2>/dev/null || true
   echo
 
   echo "-- Nodes"
-  NODE_LIST="$(get_node_list "$P" || true)"
-  if [[ -z "${NODE_LIST:-}" ]]; then
-    echo "(0 Nodes visibles dans /$P)"
-  else
-    while IFS= read -r NODE || [[ -n "$NODE" ]]; do
-      [[ -z "$NODE" ]] && continue
-      NAVAIL="$(get_node_availability "$P" "$NODE")"
-      printf "%s ; %s\n" "$NODE" "$NAVAIL"
-    done <<< "$NODE_LIST"
-  fi
-
+  tmsh -c "cd /${P}; list ltm node recursive one-line" 2>/dev/null || true
   echo
-done <<< "$PARTS"
+done
+
 REMOTE_BASH
+
+echo "✅ Check terminé"
+echo "📄 Fichier généré : $OUTPUT_FILE"
