@@ -70,13 +70,11 @@ get_pool_availability() {
   tmsh -c "cd /${P}; show ltm pool ${POOL}" 2>/dev/null | first_availability_from_show
 }
 
-# Members parser ROBUST (tolérant + fallback)
 get_pool_members_status() {
   local P="$1" POOL="$2"
   local line member="" status="" val=""
 
   shopt -s nocasematch
-
   local RAW
   RAW="$(tmsh -c "cd /${P}; show ltm pool ${POOL} members" 2>/dev/null || true)"
 
@@ -93,23 +91,16 @@ get_pool_members_status() {
 
     if [[ -n "$member" ]]; then
       if [[ "$line" == *"Availability"*:* ]]; then
-        val="${line#*:}"
-        val="$(trim "$val")"
-        status="${val:-UNKNOWN}"
+        val="${line#*:}"; val="$(trim "$val")"; status="${val:-UNKNOWN}"
       elif [[ "$line" == *"State"*:* && -z "$status" ]]; then
-        val="${line#*:}"
-        val="$(trim "$val")"
-        status="${val:-UNKNOWN}"
+        val="${line#*:}"; val="$(trim "$val")"; status="${val:-UNKNOWN}"
       elif [[ "$line" == *"Session"*:* && -z "$status" ]]; then
-        val="${line#*:}"
-        val="$(trim "$val")"
-        status="${val:-UNKNOWN}"
+        val="${line#*:}"; val="$(trim "$val")"; status="${val:-UNKNOWN}"
       fi
 
       if [[ -n "$status" ]]; then
         printf "%s ; %s\n" "$member" "$status"
-        member=""
-        status=""
+        member=""; status=""
       fi
     fi
   done <<< "$RAW"
@@ -126,16 +117,16 @@ get_pool_members_status() {
   shopt -u nocasematch
 }
 
-# ---------- NODES ----------
-get_node_list() {
-  local P="$1"
-  tmsh -c "cd /${P}; list ltm node recursive one-line" 2>/dev/null \
+# ---------- NODES (GLOBAL) ----------
+get_node_list_global() {
+  # Pas de cd => on récupère ce que l’utilisateur est autorisé à voir, souvent /Common + sous-folders
+  tmsh -c "list ltm node recursive one-line" 2>/dev/null \
   | awk '$1=="ltm" && $2=="node" {print $3}'
 }
 
-get_node_availability() {
-  local P="$1" NODE="$2"
-  tmsh -c "cd /${P}; show ltm node ${NODE}" 2>/dev/null | first_availability_from_show
+get_node_availability_global() {
+  local NODE="$1"
+  tmsh -c "show ltm node ${NODE}" 2>/dev/null | first_availability_from_show
 }
 
 # ---------- MAIN ----------
@@ -145,12 +136,12 @@ if [[ -z "${PARTS:-}" ]]; then
   exit 1
 fi
 
+# VS + Pools par partition
 while IFS= read -r P || [[ -n "$P" ]]; do
   [[ -z "$P" ]] && continue
 
   echo "===== /$P ====="
 
-  # VS
   echo "-- Virtual Servers"
   VS_LIST="$(get_vs_list "$P" || true)"
   if [[ -z "${VS_LIST:-}" ]]; then
@@ -164,8 +155,6 @@ while IFS= read -r P || [[ -n "$P" ]]; do
   fi
 
   echo
-
-  # Pools + Members
   echo "-- Pools"
   POOL_LIST="$(get_pool_list "$P" || true)"
   if [[ -z "${POOL_LIST:-}" ]]; then
@@ -195,26 +184,23 @@ while IFS= read -r P || [[ -n "$P" ]]; do
           done <<< "$MEMBERS"
         fi
       fi
-
       echo
     done <<< "$POOL_LIST"
   fi
 
   echo
-
-  # Nodes
-  echo "-- Nodes"
-  NODE_LIST="$(get_node_list "$P" || true)"
-  if [[ -z "${NODE_LIST:-}" ]]; then
-    echo "(0 Nodes visibles dans /$P)"
-  else
-    while IFS= read -r NODE || [[ -n "$NODE" ]]; do
-      [[ -z "$NODE" ]] && continue
-      NAVAIL="$(get_node_availability "$P" "$NODE")"
-      printf "%s ; %s\n" "$NODE" "$NAVAIL"
-    done <<< "$NODE_LIST"
-  fi
-
-  echo
 done <<< "$PARTS"
+
+# Nodes en global (une seule fois)
+echo "===== NODES (global) ====="
+NODE_LIST="$(get_node_list_global || true)"
+if [[ -z "${NODE_LIST:-}" ]]; then
+  echo "(0 Nodes visibles globalement — droits ? nodes dans partitions non accessibles ?)"
+else
+  while IFS= read -r NODE || [[ -n "$NODE" ]]; do
+    [[ -z "$NODE" ]] && continue
+    NAVAIL="$(get_node_availability_global "$NODE")"
+    printf "%s ; %s\n" "$NODE" "$NAVAIL"
+  done <<< "$NODE_LIST"
+fi
 REMOTE_BASH
