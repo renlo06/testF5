@@ -39,11 +39,26 @@ first_availability_from_show() {
   return 0
 }
 
-get_partitions() {
-  tmsh -c "list auth partition one-line" \
-  | awk '$1=="auth" && $2=="partition" {print $3}' \
+# ---------- NODES (filtrés par partition, sans cd) ----------
+get_node_list_partition() {
+  local P="$1"
+
+  tmsh -c "list ltm node recursive one-line" 2>/dev/null \
+  | awk -v part="/${P}/" '
+      $1=="ltm" && $2=="node" {
+        node=$3
+        # si fullPath commence par /Partition/
+        if (index(node, part)==1 || node==substr(part,2)) {
+          print node
+        }
+      }' \
   | sed '/^$/d' \
   | sort -u
+}
+
+get_node_availability_partition() {
+  local NODE="$1"
+  tmsh -c "show ltm node ${NODE}" 2>/dev/null | first_availability_from_show
 }
 
 # ---------- VS ----------
@@ -192,15 +207,18 @@ while IFS= read -r P || [[ -n "$P" ]]; do
 done <<< "$PARTS"
 
 # Nodes en global (une seule fois)
-echo "===== NODES (global) ====="
-NODE_LIST="$(get_node_list_global || true)"
+echo "-- Nodes"
+NODE_LIST="$(get_node_list_partition "$P" || true)"
+
 if [[ -z "${NODE_LIST:-}" ]]; then
-  echo "(0 Nodes visibles globalement — droits ? nodes dans partitions non accessibles ?)"
+  echo "(0 Nodes visibles dans /$P)"
 else
   while IFS= read -r NODE || [[ -n "$NODE" ]]; do
     [[ -z "$NODE" ]] && continue
-    NAVAIL="$(get_node_availability_global "$NODE")"
+    NAVAIL="$(get_node_availability_partition "$NODE")"
     printf "%s ; %s\n" "$NODE" "$NAVAIL"
   done <<< "$NODE_LIST"
 fi
+
+echo
 REMOTE_BASH
