@@ -47,12 +47,34 @@ get_partitions() {
 }
 
 # ---------- ASM POLICIES ----------
-# On liste globalement (ASM policies ne se gèrent pas toujours "par partition" comme LTM)
 get_asm_policies() {
   tmsh -c "list asm policy recursive" 2>/dev/null \
-  | awk '
-      $1=="asm" && $2=="policy" {print $3}
-    ' \
+  | awk '$1=="asm" && $2=="policy" {print $3}' \
+  | sed '/^$/d' \
+  | sort -u
+}
+
+# ---------- AFM POLICIES ----------
+# Firewall policies
+get_afm_fw_policies() {
+  tmsh -c "list security firewall policy recursive" 2>/dev/null \
+  | awk '$1=="security" && $2=="firewall" && $3=="policy" {print $4}' \
+  | sed '/^$/d' \
+  | sort -u
+}
+
+# NAT policies (si utilisées)
+get_afm_nat_policies() {
+  tmsh -c "list security nat policy recursive" 2>/dev/null \
+  | awk '$1=="security" && $2=="nat" && $3=="policy" {print $4}' \
+  | sed '/^$/d' \
+  | sort -u
+}
+
+# Protocol Security policies (si utilisées)
+get_afm_protocol_security_policies() {
+  tmsh -c "list security protocol-security policy recursive" 2>/dev/null \
+  | awk '$1=="security" && $2=="protocol-security" && $3=="policy" {print $4}' \
   | sed '/^$/d' \
   | sort -u
 }
@@ -154,7 +176,7 @@ get_node_availability() {
   tmsh -c "cd /${P}; show ltm node ${NODE}" 2>/dev/null | first_availability_from_show
 }
 
-# ---------- MAIN ----------
+# ---------- MAIN (POLICIES) ----------
 echo "===== ASM Policies ====="
 ASM_LIST="$(get_asm_policies || true)"
 if [[ -z "${ASM_LIST:-}" ]]; then
@@ -164,6 +186,35 @@ else
 fi
 echo
 
+echo "===== AFM Policies ====="
+echo "-- Firewall policies"
+FW_LIST="$(get_afm_fw_policies || true)"
+if [[ -z "${FW_LIST:-}" ]]; then
+  echo "(0 firewall policies visibles ou module AFM non accessible)"
+else
+  printf "%s\n" "$FW_LIST"
+fi
+echo
+
+echo "-- NAT policies"
+NAT_LIST="$(get_afm_nat_policies || true)"
+if [[ -z "${NAT_LIST:-}" ]]; then
+  echo "(0 nat policies visibles ou non utilisées)"
+else
+  printf "%s\n" "$NAT_LIST"
+fi
+echo
+
+echo "-- Protocol Security policies"
+PS_LIST="$(get_afm_protocol_security_policies || true)"
+if [[ -z "${PS_LIST:-}" ]]; then
+  echo "(0 protocol-security policies visibles ou non utilisées)"
+else
+  printf "%s\n" "$PS_LIST"
+fi
+echo
+
+# ---------- MAIN (LTM by partition) ----------
 PARTS="$(get_partitions || true)"
 if [[ -z "${PARTS:-}" ]]; then
   echo "❌ Aucune partition visible (droits insuffisants ?) ou sortie vide."
@@ -216,6 +267,7 @@ while IFS= read -r P || [[ -n "$P" ]]; do
           done <<< "$MEMBERS"
         fi
       fi
+
       echo
     done <<< "$POOL_LIST"
   fi
