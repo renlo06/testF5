@@ -44,7 +44,6 @@ trim() {
   printf "%s" "$s"
 }
 
-# Normalise un statut F5 -> UP/DOWN/UNKNOWN
 norm_status() {
   local s="${1:-UNKNOWN}"
   s="$(trim "$s")"
@@ -59,7 +58,6 @@ norm_status() {
   echo "UNKNOWN"
 }
 
-# lit stdin d'un "show ..." et retourne la 1ère valeur après "Availability :"
 first_availability_from_show() {
   local line val
   while IFS= read -r line; do
@@ -77,7 +75,6 @@ first_availability_from_show() {
 #######################################
 # GTM WideIP
 #######################################
-# Retourne lignes: "type ; name"
 get_wideips() {
   tmsh -c "cd /; list gtm wideip recursive one-line" 2>/dev/null \
   | awk '$1=="gtm" && $2=="wideip" {print $3 " ; " $4}' \
@@ -92,7 +89,6 @@ get_wideip_avail() {
 #######################################
 # GTM Pools
 #######################################
-# Retourne lignes: "type ; name"
 get_gtm_pools() {
   tmsh -c "cd /; list gtm pool recursive one-line" 2>/dev/null \
   | awk '$1=="gtm" && $2=="pool" {print $3 " ; " $4}' \
@@ -104,8 +100,6 @@ get_gtm_pool_avail() {
   tmsh -c "cd /; show gtm pool ${TYPE} ${NAME}" 2>/dev/null | first_availability_from_show
 }
 
-# Members parser (tolérant) pour GTM pool
-# Retourne: "member ; status"
 get_gtm_pool_members_status() {
   local TYPE="$1" NAME="$2"
   local line member="" status="" val=""
@@ -156,41 +150,48 @@ get_gtm_pool_members_status() {
 }
 
 #######################################
-# GTM Servers + iQuery  (✅ corrigé avec cd / + fallback)
+# ✅ GTM Servers + iQuery (FIX)
+# On force "-a" (all partitions) et parsing tolérant.
 #######################################
 get_gtm_servers() {
   local out=""
 
-  out="$(tmsh -c "cd /; list gtm server recursive one-line" 2>/dev/null \
-        | awk '$1=="gtm" && $2=="server" {print $3}' \
+  # 1) one-line (all partitions)
+  out="$(tmsh -a -c "list gtm server one-line" 2>/dev/null \
+        | sed -n 's/^gtm server \([^ ]*\).*/\1/p' \
         | sed 's/[{;]//g' || true)"
 
+  # 2) recursive one-line (all partitions)
   if [[ -z "${out:-}" ]]; then
-    out="$(tmsh -c "cd /; list gtm server one-line" 2>/dev/null \
-          | awk '$1=="gtm" && $2=="server" {print $3}' \
+    out="$(tmsh -a -c "list gtm server recursive one-line" 2>/dev/null \
+          | sed -n 's/^gtm server \([^ ]*\).*/\1/p' \
           | sed 's/[{;]//g' || true)"
   fi
 
+  # 3) recursive (multiline) (all partitions)
   if [[ -z "${out:-}" ]]; then
-    out="$(tmsh -c "cd /; list gtm server recursive" 2>/dev/null \
-          | awk '$1=="gtm" && $2=="server" {print $3}' \
+    out="$(tmsh -a -c "list gtm server recursive" 2>/dev/null \
+          | sed -n 's/^gtm server \([^ ]*\).*/\1/p' \
           | sed 's/[{;]//g' || true)"
   fi
 
   printf "%s\n" "$out" | sed '/^$/d' | sort -u
 }
 
-get_gtm_server_avail() {
+get_gtm_server_show() {
   local S="$1"
-  tmsh -c "cd /; show gtm server ${S}" 2>/dev/null | first_availability_from_show
+  tmsh -c "cd /; show gtm server ${S}" 2>/dev/null || true
 }
 
-# iQuery par server: extraction tolérante depuis "show gtm server"
+get_gtm_server_avail() {
+  local S="$1"
+  get_gtm_server_show "$S" | first_availability_from_show
+}
+
 get_gtm_server_iquery() {
   local S="$1"
   local out
-
-  out="$(tmsh -c "cd /; show gtm server ${S}" 2>/dev/null \
+  out="$(get_gtm_server_show "$S" \
         | awk '
             BEGIN{IGNORECASE=1}
             /iquery/ && /:/ {
@@ -200,11 +201,9 @@ get_gtm_server_iquery() {
               if (s!="") {print s; exit}
             }
           ' || true)"
-
   [[ -n "${out:-}" ]] && printf "%s" "$out" || printf "UNKNOWN"
 }
 
-# iQuery global (si dispo) : sortie compacte
 show_gtm_iquery_compact() {
   local RAW
   RAW="$(tmsh -c "cd /; show gtm iquery" 2>/dev/null || true)"
@@ -307,6 +306,7 @@ if [[ -z "${SERVERS:-}" ]]; then
 else
   while IFS= read -r S || [[ -n "$S" ]]; do
     [[ -z "$S" ]] && continue
+
     SAV="$(get_gtm_server_avail "$S")"
     SST="$(norm_status "$SAV")"
     GS_TOTAL=$((GS_TOTAL+1))
