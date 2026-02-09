@@ -56,63 +56,7 @@ trim() {
 
 tolower() { printf "%s" "$1" | tr '[:upper:]' '[:lower:]'; }
 
-# ---- Robust failover state detection ----
-get_failover_state() {
-  local raw st host
-  host="$(hostname 2>/dev/null || echo "")"
-
-  # 1) show sys failover (souvent le plus simple)
-  raw="$(tmsh -c "show sys failover" 2>/dev/null || true)"
-  st="$(printf "%s\n" "$raw" | awk '
-      BEGIN{IGNORECASE=1}
-      /status/ && /active/  {print "active"; exit}
-      /status/ && /standby/ {print "standby"; exit}
-    ' || true)"
-  [[ -n "${st:-}" ]] && { echo "$st"; return 0; }
-
-  # 2) show cm failover-status (format variable)
-  raw="$(tmsh -c "show cm failover-status" 2>/dev/null || true)"
-  st="$(printf "%s\n" "$raw" | awk '
-      BEGIN{IGNORECASE=1}
-      /^[[:space:]]*status[[:space:]]*:/ && /active/  {print "active"; exit}
-      /^[[:space:]]*status[[:space:]]*:/ && /standby/ {print "standby"; exit}
-      /active/  {print "active"; exit}
-      /standby/ {print "standby"; exit}
-    ' || true)"
-  [[ -n "${st:-}" ]] && { echo "$st"; return 0; }
-
-  # 3) show cm traffic-group (déduit via traffic-group-1)
-  raw="$(tmsh -c "show cm traffic-group" 2>/dev/null || true)"
-  # Exemple: "traffic-group-1 ... active on /Common/deviceA"
-  st="$(printf "%s\n" "$raw" | awk -v h="$host" '
-      BEGIN{IGNORECASE=1}
-      /traffic-group-1/ && /active on/ {
-        if (h!="" && index($0,h)>0) {print "active"} else {print "standby"}
-        exit
-      }
-    ' || true)"
-  [[ -n "${st:-}" ]] && { echo "$st"; return 0; }
-
-  echo "unknown"
-}
-
-get_sync_status() {
-  local raw s
-  raw="$(tmsh -c "show cm sync-status" 2>/dev/null || true)"
-  s="$(printf "%s\n" "$raw" | awk '
-      BEGIN{IGNORECASE=1}
-      /^[[:space:]]*Status[[:space:]]*:/ {
-        sub(/^[^:]*:[[:space:]]*/,"")
-        print
-        exit
-      }' | sed 's/[[:space:]]\+/ /g' || true)"
-  s="$(trim "${s:-}")"
-  [[ -n "$s" ]] && echo "$s" || echo "unknown"
-}
-
-# ---- Device-group detection ----
 get_device_group() {
-  # Premier DG trouvé (souvent suffisant en exploitation)
   tmsh -c "list cm device-group one-line" 2>/dev/null \
   | awk '$1=="cm" && $2=="device-group" {print $3; exit}' || true
 }
@@ -121,8 +65,60 @@ get_members_count() {
   local dg="$1"
   local line
   line="$(tmsh -c "list cm device-group ${dg} one-line" 2>/dev/null || true)"
-  # Compte les chemins /Common/xxx dans devices { ... }
   printf "%s\n" "$line" | grep -oE '/[^[:space:]}]+' | wc -l | awk '{print $1}'
+}
+
+# ✅ PARSING CALÉ SUR TON FORMAT
+get_failover_state() {
+  local raw st
+
+  # 1) show sys failover -> "Failover active"
+  raw="$(tmsh -c "show sys failover" 2>/dev/null || true)"
+  st="$(printf "%s\n" "$raw" \
+        | awk 'BEGIN{IGNORECASE=1} /^failover[[:space:]]+/ {print $2; exit}' \
+        | tr '[:upper:]' '[:lower:]' || true)"
+  st="$(trim "${st:-}")"
+  if [[ "$st" == "active" || "$st" == "standby" ]]; then
+    echo "$st"; return 0
+  fi
+
+  # 2) show cm failover-status -> ligne "Status ACTIVE"
+  raw="$(tmsh -c "show cm failover-status" 2>/dev/null || true)"
+  st="$(printf "%s\n" "$raw" \
+        | awk 'BEGIN{IGNORECASE=1} /^[[:space:]]*status[[:space:]]+/ {print $2; exit}' \
+        | tr '[:upper:]' '[:lower:]' || true)"
+  st="$(trim "${st:-}")"
+  if [[ "$st" == "active" || "$st" == "standby" ]]; then
+    echo "$st"; return 0
+  fi
+
+  # 3) fallback traffic-group (format compact)
+  # ex: "traffic-group-1 ... active" / "traffic-group-1 ... standby"
+  raw="$(tmsh -c "show cm traffic-group" 2>/dev/null || true)"
+  st="$(printf "%s\n" "$raw" \
+        | awk 'BEGIN{IGNORECASE=1}
+               $1 ~ /^traffic-group-1/ {
+                 for(i=NF;i>=1;i--){
+                   if(tolower($i)=="active"){print "active"; exit}
+                   if(tolower($i)=="standby"){print "standby"; exit}
+                 }
+               }' || true)"
+  st="$(trim "${st:-}")"
+  if [[ "$st" == "active" || "$st" == "standby" ]]; then
+    echo "$st"; return 0
+  fi
+
+  echo "unknown"
+}
+
+get_sync_status() {
+  local raw s
+  raw="$(tmsh -c "show cm sync-status" 2>/dev/null || true)"
+  s="$(printf "%s\n" "$raw" \
+      | awk 'BEGIN{IGNORECASE=1} /^[[:space:]]*status[[:space:]]*:/ {sub(/^[^:]*:[[:space:]]*/,""); print; exit}' \
+      | sed 's/[[:space:]]\+/ /g' || true)"
+  s="$(trim "${s:-}")"
+  [[ -n "$s" ]] && echo "$s" || echo "unknown"
 }
 
 HOST="$(hostname 2>/dev/null || echo UNKNOWN)"
