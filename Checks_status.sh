@@ -72,7 +72,7 @@ parse_failover() {
     echo "$st"; return 0
   fi
 
-  # "Status ACTIVE"
+  # "Status ACTIVE" (dans CM::Failover status)
   st="$(printf "%s\n" "$raw" | awk 'BEGIN{IGNORECASE=1} $1=="Status" && ($2=="ACTIVE" || $2=="STANDBY") {print $2; exit}' \
         | tr '[:upper:]' '[:lower:]' || true)"
   st="$(trim "${st:-}")"
@@ -83,24 +83,34 @@ parse_failover() {
   echo "unknown"
 }
 
-# ✅ Ton format: "Status In Sync" (sans :)
-# + fallback "Status: In Sync" si jamais un device diffère
+# ✅ Sync-status : on PARSE UNIQUEMENT le bloc "CM::Sync Status"
+# Ton format: "Status In Sync" (sans :)
+# + fallback "Status: In Sync"
 parse_sync() {
   local raw="$1" s=""
 
   s="$(printf "%s\n" "$raw" | awk '
-      BEGIN{IGNORECASE=1}
-      /Status[[:space:]]*:/ {
-        sub(/^.*Status[[:space:]]*:[[:space:]]*/,"")
-        gsub(/[[:space:]]+/," ")
-        print
-        exit
+      BEGIN{IGNORECASE=1; in=0}
+
+      # Entrée dans le bloc
+      /^CM::Sync[[:space:]]+Status/ { in=1; next }
+
+      # Sortie du bloc si un nouveau header "XX::YY" commence
+      in==1 && /^[A-Z][A-Z0-9_-]*::/ { in=0 }
+
+      # Dans le bloc, on cherche la ligne "Status ..."
+      in==1 && /Status[[:space:]]*:/ {
+        line=$0
+        sub(/^.*Status[[:space:]]*:[[:space:]]*/,"",line)
+        gsub(/[[:space:]]+/," ",line)
+        if(line!=""){ print line; exit }
       }
-      /^[[:space:]]*Status[[:space:]]+/ {
-        sub(/^[[:space:]]*Status[[:space:]]+/,"")
-        gsub(/[[:space:]]+/," ")
-        print
-        exit
+
+      in==1 && /^[[:space:]]*Status[[:space:]]+/ {
+        line=$0
+        sub(/^[[:space:]]*Status[[:space:]]+/,"",line)
+        gsub(/[[:space:]]+/," ",line)
+        if(line!=""){ print line; exit }
       }
     ' || true)"
 
@@ -123,7 +133,6 @@ parse_sync_failover_dg() {
   dg="$(printf "%s\n" "$line" | awk '{print $3}' || true)"
   dg="$(trim "${dg:-}")"
 
-  # Compte les devices dans "devices { ... }" sur la ligne one-line
   members="$(printf "%s\n" "$line" | sed -n 's/.*devices[[:space:]]*{ *\([^}]*\) *}.*/\1/p' \
             | awk '{print NF}' || true)"
   members="${members:-0}"
@@ -170,7 +179,6 @@ while IFS= read -r LINE || [[ -n "$LINE" ]]; do
     continue
   fi
 
-  # HA detection : DG sync-failover + members>=2 => cluster/HA
   DG_INFO="$(parse_sync_failover_dg "$RAW" || true)"
   DG="none"
   MEMBERS="0"
@@ -207,7 +215,6 @@ while IFS= read -r LINE || [[ -n "$LINE" ]]; do
     esac
   fi
 
-  # Affichage terminal
   echo "mode         : $MODE"
   echo "role         : $ROLE"
   echo "device-group : $DG"
@@ -215,7 +222,6 @@ while IFS= read -r LINE || [[ -n "$LINE" ]]; do
   echo "failover     : $FAILOVER"
   echo "sync-status  : $SYNC"
 
-  # TXT
   {
     echo "Host: $HOST"
     echo "  mode         : $MODE"
