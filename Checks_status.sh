@@ -42,7 +42,6 @@ trim() {
 
 #######################################
 # SSH runner (tmsh interactive)
-# On ne "split" pas par sections, on parse la sortie globale.
 #######################################
 tmsh_batch() {
   local host="$1"
@@ -62,10 +61,10 @@ EOF
 #######################################
 # PARSERS (sur sortie brute)
 #######################################
-# Failover : priorise "Failover active/standby", sinon "Status ACTIVE/STANDBY"
 parse_failover() {
   local raw="$1" st=""
 
+  # "Failover active"
   st="$(printf "%s\n" "$raw" | awk 'BEGIN{IGNORECASE=1} $1=="Failover" {print $2; exit}' \
         | tr '[:upper:]' '[:lower:]' || true)"
   st="$(trim "${st:-}")"
@@ -73,6 +72,7 @@ parse_failover() {
     echo "$st"; return 0
   fi
 
+  # "Status ACTIVE"
   st="$(printf "%s\n" "$raw" | awk 'BEGIN{IGNORECASE=1} $1=="Status" && ($2=="ACTIVE" || $2=="STANDBY") {print $2; exit}' \
         | tr '[:upper:]' '[:lower:]' || true)"
   st="$(trim "${st:-}")"
@@ -83,32 +83,35 @@ parse_failover() {
   echo "unknown"
 }
 
-# Sync status : récupère la valeur après "Status : ..."
+# ✅ Ton format: "Status In Sync" (sans :)
+# + fallback "Status: In Sync" si jamais un device diffère
 parse_sync() {
   local raw="$1" s=""
+
   s="$(printf "%s\n" "$raw" | awk '
       BEGIN{IGNORECASE=1}
-      $1=="Status" && $2 ~ /^:/ {
-        sub(/^Status[[:space:]]*:[[:space:]]*/,"")
+      /Status[[:space:]]*:/ {
+        sub(/^.*Status[[:space:]]*:[[:space:]]*/,"")
+        gsub(/[[:space:]]+/," ")
         print
         exit
       }
-      $1=="Status" && $0 ~ /Status[[:space:]]*:/ {
-        sub(/^.*Status[[:space:]]*:[[:space:]]*/,"")
+      /^[[:space:]]*Status[[:space:]]+/ {
+        sub(/^[[:space:]]*Status[[:space:]]+/,"")
+        gsub(/[[:space:]]+/," ")
         print
         exit
-      }' | sed 's/[[:space:]]\+/ /g' || true)"
-  s="$(trim "${s:-}")"
+      }
+    ' || true)"
+
+  s="$(printf "%s" "$s" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
   [[ -n "$s" ]] && echo "$s" || echo "unknown"
 }
 
-# Device-group HA : prendre un DG de type sync-failover (le plus pertinent HA)
+# Device-group HA : prendre un DG de type sync-failover
 # Retourne: "DG_NAME|MEMBERS_COUNT" ou vide
 parse_sync_failover_dg() {
   local raw="$1"
-  # Cherche une ligne "cm device-group <name> { ... type sync-failover ... devices { ... } }"
-  # 1) récupère le nom du DG (3e champ)
-  # 2) compte les devices entre "devices {" et "}" sur la même ligne (one-line)
   local line dg members
 
   line="$(printf "%s\n" "$raw" | awk '
@@ -120,7 +123,7 @@ parse_sync_failover_dg() {
   dg="$(printf "%s\n" "$line" | awk '{print $3}' || true)"
   dg="$(trim "${dg:-}")"
 
-  # Compte les tokens /Common/deviceX dans la section devices { ... } (ligne one-line)
+  # Compte les devices dans "devices { ... }" sur la ligne one-line
   members="$(printf "%s\n" "$line" | sed -n 's/.*devices[[:space:]]*{ *\([^}]*\) *}.*/\1/p' \
             | awk '{print NF}' || true)"
   members="${members:-0}"
@@ -190,6 +193,7 @@ while IFS= read -r LINE || [[ -n "$LINE" ]]; do
     SYNC="$(parse_sync "$RAW")"
   else
     FAILOVER="unknown"
+    SYNC="unknown"
   fi
 
   ROLE="ha-unknown"
