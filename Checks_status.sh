@@ -54,10 +54,80 @@ trim() {
   printf "%s" "$s"
 }
 
+tolower() { printf "%s" "$1" | tr '[:upper:]' '[:lower:]'; }
+
+# ---- Robust failover state detection ----
+get_failover_state() {
+  local raw st host
+  host="$(hostname 2>/dev/null || echo "")"
+
+  # 1) show sys failover (souvent le plus simple)
+  raw="$(tmsh -c "show sys failover" 2>/dev/null || true)"
+  st="$(printf "%s\n" "$raw" | awk '
+      BEGIN{IGNORECASE=1}
+      /status/ && /active/  {print "active"; exit}
+      /status/ && /standby/ {print "standby"; exit}
+    ' || true)"
+  [[ -n "${st:-}" ]] && { echo "$st"; return 0; }
+
+  # 2) show cm failover-status (format variable)
+  raw="$(tmsh -c "show cm failover-status" 2>/dev/null || true)"
+  st="$(printf "%s\n" "$raw" | awk '
+      BEGIN{IGNORECASE=1}
+      /^[[:space:]]*status[[:space:]]*:/ && /active/  {print "active"; exit}
+      /^[[:space:]]*status[[:space:]]*:/ && /standby/ {print "standby"; exit}
+      /active/  {print "active"; exit}
+      /standby/ {print "standby"; exit}
+    ' || true)"
+  [[ -n "${st:-}" ]] && { echo "$st"; return 0; }
+
+  # 3) show cm traffic-group (déduit via traffic-group-1)
+  raw="$(tmsh -c "show cm traffic-group" 2>/dev/null || true)"
+  # Exemple: "traffic-group-1 ... active on /Common/deviceA"
+  st="$(printf "%s\n" "$raw" | awk -v h="$host" '
+      BEGIN{IGNORECASE=1}
+      /traffic-group-1/ && /active on/ {
+        if (h!="" && index($0,h)>0) {print "active"} else {print "standby"}
+        exit
+      }
+    ' || true)"
+  [[ -n "${st:-}" ]] && { echo "$st"; return 0; }
+
+  echo "unknown"
+}
+
+get_sync_status() {
+  local raw s
+  raw="$(tmsh -c "show cm sync-status" 2>/dev/null || true)"
+  s="$(printf "%s\n" "$raw" | awk '
+      BEGIN{IGNORECASE=1}
+      /^[[:space:]]*Status[[:space:]]*:/ {
+        sub(/^[^:]*:[[:space:]]*/,"")
+        print
+        exit
+      }' | sed 's/[[:space:]]\+/ /g' || true)"
+  s="$(trim "${s:-}")"
+  [[ -n "$s" ]] && echo "$s" || echo "unknown"
+}
+
+# ---- Device-group detection ----
+get_device_group() {
+  # Premier DG trouvé (souvent suffisant en exploitation)
+  tmsh -c "list cm device-group one-line" 2>/dev/null \
+  | awk '$1=="cm" && $2=="device-group" {print $3; exit}' || true
+}
+
+get_members_count() {
+  local dg="$1"
+  local line
+  line="$(tmsh -c "list cm device-group ${dg} one-line" 2>/dev/null || true)"
+  # Compte les chemins /Common/xxx dans devices { ... }
+  printf "%s\n" "$line" | grep -oE '/[^[:space:]}]+' | wc -l | awk '{print $1}'
+}
+
 HOST="$(hostname 2>/dev/null || echo UNKNOWN)"
 
-DG_LINE="$(tmsh -c "list cm device-group one-line" 2>/dev/null | awk '$1=="cm" && $2=="device-group" {print; exit}' || true)"
-DG="$(printf "%s" "$DG_LINE" | awk '{print $3}' || true)"
+DG="$(get_device_group)"
 DG="$(trim "${DG:-}")"
 
 MODE="standalone"
@@ -67,31 +137,12 @@ SYNC="unknown"
 
 if [[ -n "${DG:-}" ]]; then
   MODE="cluster"
-
-  DG_FULL="$(tmsh -c "list cm device-group ${DG} one-line" 2>/dev/null || true)"
-  MEMBERS="$(printf "%s\n" "$DG_FULL" | grep -oE '/[^[:space:]}]+' | wc -l | awk '{print $1}')"
+  MEMBERS="$(get_members_count "$DG")"
   MEMBERS="${MEMBERS:-0}"
-
-  FO_RAW="$(tmsh -c "show cm failover-status" 2>/dev/null || true)"
-
-  FAILOVER="$(printf "%s\n" "$FO_RAW" \
-    | awk 'BEGIN{IGNORECASE=1} /^[[:space:]]*Status[[:space:]]*:/ {print $NF; exit}' \
-    | tr '[:upper:]' '[:lower:]' || true)"
-
-  if [[ -z "${FAILOVER:-}" ]]; then
-    FAILOVER="$(printf "%s\n" "$FO_RAW" \
-      | awk 'BEGIN{IGNORECASE=1} /active/ {print "active"; exit} /standby/ {print "standby"; exit}' || true)"
-  fi
-
+  FAILOVER="$(get_failover_state)"
   FAILOVER="$(trim "${FAILOVER:-unknown}")"
-  [[ "$FAILOVER" == "active" || "$FAILOVER" == "standby" ]] || FAILOVER="unknown"
-
-  SY_RAW="$(tmsh -c "show cm sync-status" 2>/dev/null || true)"
-  SYNC="$(printf "%s\n" "$SY_RAW" \
-    | awk 'BEGIN{IGNORECASE=1} /^[[:space:]]*Status[[:space:]]*:/ {sub(/^[^:]*:[[:space:]]*/,""); print; exit}' \
-    | sed 's/[[:space:]]\+/ /g' || true)"
+  SYNC="$(get_sync_status)"
   SYNC="$(trim "${SYNC:-unknown}")"
-  [[ -n "$SYNC" ]] || SYNC="unknown"
 fi
 
 printf "HOST=%s\n" "$HOST"
@@ -130,10 +181,11 @@ while IFS= read -r LINE || [[ -n "$LINE" ]]; do
     FAILOVER=$(printf "%s\n" "$OUT" | awk -F= '$1=="FAILOVER"{print $2}')
     SYNC=$(printf "%s\n" "$OUT" | awk -F= '$1=="SYNC"{print $2}')
 
-    # role explicite
     ROLE="ha-unknown"
     if [[ "${MODE:-}" == "standalone" ]]; then
       ROLE="standalone"
+      FAILOVER="unknown"
+      SYNC="unknown"
     else
       case "${FAILOVER:-unknown}" in
         active)  ROLE="ha-active" ;;
