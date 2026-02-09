@@ -90,3 +90,147 @@ parse_sync() {
       BEGIN{IGNORECASE=1}
       $1=="Status" && $2 ~ /^:/ {
         sub(/^Status[[:space:]]*:[[:space:]]*/,"")
+        print
+        exit
+      }
+      $1=="Status" && $0 ~ /Status[[:space:]]*:/ {
+        sub(/^.*Status[[:space:]]*:[[:space:]]*/,"")
+        print
+        exit
+      }' | sed 's/[[:space:]]\+/ /g' || true)"
+  s="$(trim "${s:-}")"
+  [[ -n "$s" ]] && echo "$s" || echo "unknown"
+}
+
+# Device-group HA : prendre un DG de type sync-failover (le plus pertinent HA)
+# Retourne: "DG_NAME|MEMBERS_COUNT" ou vide
+parse_sync_failover_dg() {
+  local raw="$1"
+  # Cherche une ligne "cm device-group <name> { ... type sync-failover ... devices { ... } }"
+  # 1) récupère le nom du DG (3e champ)
+  # 2) compte les devices entre "devices {" et "}" sur la même ligne (one-line)
+  local line dg members
+
+  line="$(printf "%s\n" "$raw" | awk '
+      BEGIN{IGNORECASE=1}
+      $1=="cm" && $2=="device-group" && $0 ~ /type[[:space:]]+sync-failover/ {print; exit}
+    ' || true)"
+  [[ -z "$(trim "${line:-}")" ]] && return 1
+
+  dg="$(printf "%s\n" "$line" | awk '{print $3}' || true)"
+  dg="$(trim "${dg:-}")"
+
+  # Compte les tokens /Common/deviceX dans la section devices { ... } (ligne one-line)
+  members="$(printf "%s\n" "$line" | sed -n 's/.*devices[[:space:]]*{ *\([^}]*\) *}.*/\1/p' \
+            | awk '{print NF}' || true)"
+  members="${members:-0}"
+
+  printf "%s|%s\n" "${dg:-none}" "$members"
+}
+
+#######################################
+# MAIN LOOP
+#######################################
+TOTAL=$(grep -Ev '^\s*#|^\s*$' "$DEVICES_FILE" | wc -l | awk '{print $1}')
+COUNT=0
+FAILS=0
+
+{
+  echo "Run: $TS"
+  echo
+} >> "$TXT_OUT"
+
+while IFS= read -r LINE || [[ -n "$LINE" ]]; do
+  HOST=$(printf "%s" "$LINE" | tr -d '\r' | awk '{$1=$1;print}')
+  [[ -z "$HOST" || "$HOST" =~ ^# ]] && continue
+
+  COUNT=$((COUNT+1))
+  echo "======================================"
+  echo "➡️  [$COUNT/$TOTAL] BIG-IP : $HOST"
+  echo "======================================"
+
+  set +e
+  RAW="$(tmsh_batch "$HOST")"
+  RC=$?
+  set -e
+
+  if [[ $RC -ne 0 || -z "$(trim "${RAW:-}")" ]]; then
+    echo "❌ Échec récupération infos HA (SSH/TMSH) : $HOST"
+    FAILS=$((FAILS+1))
+    {
+      echo "Host: $HOST"
+      echo "  role : error"
+      echo "  ERROR: SSH/TMSH failed or empty output"
+      echo
+    } >> "$TXT_OUT"
+    echo
+    continue
+  fi
+
+  # HA detection : DG sync-failover + members>=2 => cluster/HA
+  DG_INFO="$(parse_sync_failover_dg "$RAW" || true)"
+  DG="none"
+  MEMBERS="0"
+  MODE="standalone"
+
+  if [[ -n "$(trim "${DG_INFO:-}")" ]]; then
+    DG="${DG_INFO%%|*}"
+    MEMBERS="${DG_INFO##*|}"
+    MEMBERS="$(trim "$MEMBERS")"
+    if [[ "${MEMBERS:-0}" =~ ^[0-9]+$ ]] && (( MEMBERS >= 2 )); then
+      MODE="cluster"
+    else
+      MODE="standalone"
+    fi
+  fi
+
+  FAILOVER="$(parse_failover "$RAW")"
+  SYNC="unknown"
+  if [[ "$MODE" == "cluster" ]]; then
+    SYNC="$(parse_sync "$RAW")"
+  else
+    FAILOVER="unknown"
+  fi
+
+  ROLE="ha-unknown"
+  if [[ "$MODE" == "standalone" ]]; then
+    ROLE="standalone"
+  else
+    case "$FAILOVER" in
+      active)  ROLE="ha-active" ;;
+      standby) ROLE="ha-standby" ;;
+      *)       ROLE="ha-unknown" ;;
+    esac
+  fi
+
+  # Affichage terminal
+  echo "mode         : $MODE"
+  echo "role         : $ROLE"
+  echo "device-group : $DG"
+  echo "members      : $MEMBERS"
+  echo "failover     : $FAILOVER"
+  echo "sync-status  : $SYNC"
+
+  # TXT
+  {
+    echo "Host: $HOST"
+    echo "  mode         : $MODE"
+    echo "  role         : $ROLE"
+    echo "  device-group : $DG"
+    echo "  members      : $MEMBERS"
+    echo "  failover     : $FAILOVER"
+    echo "  sync-status  : $SYNC"
+    echo
+  } >> "$TXT_OUT"
+
+  echo
+done < "$DEVICES_FILE"
+
+echo "======================================"
+echo "🏁 Terminé"
+echo "📁 Run dir : $RUN_DIR"
+echo "📝 TXT     : $TXT_OUT"
+echo "❌ Échecs  : $FAILS"
+echo "======================================"
+
+(( FAILS == 0 )) || exit 1
