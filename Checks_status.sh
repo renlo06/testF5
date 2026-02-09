@@ -47,25 +47,76 @@ trim() {
   printf "%s" "$s"
 }
 
-# --- DG / members ---
+# Exécute une commande et renvoie stdout (sans casser set -e)
+run_cmd() {
+  # shellcheck disable=SC2086
+  sh -c "$1" 2>/dev/null || true
+}
+
+# Essaie plusieurs commandes, retourne la première sortie non vide
+first_non_empty() {
+  local out
+  while [[ $# -gt 0 ]]; do
+    out="$(run_cmd "$1")"
+    if [[ -n "$(trim "${out:-}")" ]]; then
+      printf "%s" "$out"
+      return 0
+    fi
+    shift
+  done
+  return 1
+}
+
+# Device-group (1er trouvé)
 get_device_group() {
-  tmsh -c "list cm device-group one-line" 2>/dev/null \
+  first_non_empty \
+    'tmsh -c "list cm device-group one-line"' \
+    'tmsh list cm device-group one-line' \
+    'list cm device-group one-line' \
   | awk '$1=="cm" && $2=="device-group" {print $3; exit}' || true
 }
 
 get_members_count() {
   local dg="$1"
-  local line
-  line="$(tmsh -c "list cm device-group ${dg} one-line" 2>/dev/null || true)"
+  local line=""
+  line="$(first_non_empty \
+      "tmsh -c \"list cm device-group ${dg} one-line\"" \
+      "tmsh list cm device-group ${dg} one-line" \
+      "list cm device-group ${dg} one-line" \
+    || true)"
+
   printf "%s\n" "$line" | grep -oE '/[^[:space:]}]+' | wc -l | awk '{print $1}'
 }
 
-# --- FAILOVER (format validé chez toi) ---
+# --- FAILOVER (format validé : "Failover active" / "Status ACTIVE") ---
+get_failover_raw_sys() {
+  first_non_empty \
+    'tmsh -c "show sys failover"' \
+    'tmsh show sys failover' \
+    'show sys failover' \
+    || true
+}
+
+get_failover_raw_cm() {
+  first_non_empty \
+    'tmsh -c "show cm failover-status"' \
+    'tmsh show cm failover-status' \
+    'show cm failover-status' \
+    || true
+}
+
+get_failover_raw_tg() {
+  first_non_empty \
+    'tmsh -c "show cm traffic-group"' \
+    'tmsh show cm traffic-group' \
+    'show cm traffic-group' \
+    || true
+}
+
 get_failover_state() {
   local raw st
 
-  # 1) show sys failover => "Failover active"
-  raw="$(tmsh -c "show sys failover" 2>/dev/null || true)"
+  raw="$(get_failover_raw_sys)"
   st="$(printf "%s\n" "$raw" \
         | awk 'BEGIN{IGNORECASE=1} $1=="Failover" {print $2; exit}' \
         | tr '[:upper:]' '[:lower:]' || true)"
@@ -74,8 +125,7 @@ get_failover_state() {
     echo "$st"; return 0
   fi
 
-  # 2) show cm failover-status => contient "Status ACTIVE"
-  raw="$(tmsh -c "show cm failover-status" 2>/dev/null || true)"
+  raw="$(get_failover_raw_cm)"
   st="$(printf "%s\n" "$raw" \
         | awk 'BEGIN{IGNORECASE=1} $1=="Status" {print $2; exit}' \
         | tr '[:upper:]' '[:lower:]' || true)"
@@ -84,8 +134,7 @@ get_failover_state() {
     echo "$st"; return 0
   fi
 
-  # 3) show cm traffic-group => "traffic-group-1 ... active|standby"
-  raw="$(tmsh -c "show cm traffic-group" 2>/dev/null || true)"
+  raw="$(get_failover_raw_tg)"
   st="$(printf "%s\n" "$raw" \
         | awk 'BEGIN{IGNORECASE=1}
                $1 ~ /^traffic-group-1/ {
@@ -104,15 +153,25 @@ get_failover_state() {
 
 get_sync_status() {
   local raw s
-  raw="$(tmsh -c "show cm sync-status" 2>/dev/null || true)"
+  raw="$(first_non_empty \
+        'tmsh -c "show cm sync-status"' \
+        'tmsh show cm sync-status' \
+        'show cm sync-status' \
+        || true)"
+
+  # On prend "Status : xxx" si dispo, sinon unknown
   s="$(printf "%s\n" "$raw" \
-      | awk 'BEGIN{IGNORECASE=1} $1=="Status" {sub(/^Status[[:space:]]*:[[:space:]]*/,""); print; exit}' \
+      | awk 'BEGIN{IGNORECASE=1}
+             $1=="Status" {
+               sub(/^Status[[:space:]]*:[[:space:]]*/,"")
+               print
+               exit
+             }' \
       | sed 's/[[:space:]]\+/ /g' || true)"
   s="$(trim "${s:-}")"
   [[ -n "$s" ]] && echo "$s" || echo "unknown"
 }
 
-# --- compute ---
 DG="$(get_device_group)"
 DG="$(trim "${DG:-}")"
 
@@ -142,16 +201,20 @@ else
   esac
 fi
 
+# Debug bruts (toujours, pour diagnostic rapide)
+DBG_SYS="$(get_failover_raw_sys | tr '\n' '|' || true)"
+DBG_CM="$(get_failover_raw_cm  | tr '\n' '|' || true)"
+DBG_TG="$(get_failover_raw_tg  | tr '\n' '|' || true)"
+
 printf "MODE=%s\n" "$MODE"
 printf "ROLE=%s\n" "$ROLE"
 printf "DG=%s\n" "${DG:-none}"
 printf "MEMBERS=%s\n" "$MEMBERS"
 printf "FAILOVER=%s\n" "$FAILOVER"
 printf "SYNC=%s\n" "$SYNC"
-
-# debug lines to help diagnose parsing remotely
-printf "DBG_SYS_FAILOVER=%s\n" "$(tmsh -c "show sys failover" 2>/dev/null | tr '\n' '|' || true)"
-printf "DBG_CM_FAILOVER=%s\n" "$(tmsh -c "show cm failover-status" 2>/dev/null | tr '\n' '|' || true)"
+printf "DBG_SYS_FAILOVER=%s\n" "$DBG_SYS"
+printf "DBG_CM_FAILOVER=%s\n" "$DBG_CM"
+printf "DBG_TG=%s\n" "$DBG_TG"
 RB
 )
 
@@ -196,7 +259,11 @@ while IFS= read -r LINE || [[ -n "$LINE" ]]; do
     FAILOVER=$(printf "%s\n" "$OUT" | awk -F= '$1=="FAILOVER"{print $2}')
     SYNC=$(printf "%s\n" "$OUT" | awk -F= '$1=="SYNC"{print $2}')
 
-    # Print terminal
+    DBG_SYS=$(printf "%s\n" "$OUT" | awk -F= '$1=="DBG_SYS_FAILOVER"{print substr($0, index($0,"=")+1)}')
+    DBG_CM=$(printf "%s\n" "$OUT" | awk -F= '$1=="DBG_CM_FAILOVER"{print substr($0, index($0,"=")+1)}')
+    DBG_TG=$(printf "%s\n" "$OUT" | awk -F= '$1=="DBG_TG"{print substr($0, index($0,"=")+1)}')
+
+    # Affichage terminal
     echo "mode          : ${MODE:-unknown}"
     echo "role          : ${ROLE:-unknown}"
     echo "device-group  : ${DG:-none}"
@@ -204,7 +271,7 @@ while IFS= read -r LINE || [[ -n "$LINE" ]]; do
     echo "failover      : ${FAILOVER:-unknown}"
     echo "sync-status   : ${SYNC:-unknown}"
 
-    # Append to TXT
+    # Écriture TXT
     {
       echo "Host: $HOST"
       echo "  mode          : ${MODE:-unknown}"
@@ -213,21 +280,12 @@ while IFS= read -r LINE || [[ -n "$LINE" ]]; do
       echo "  members_count : ${MEMBERS:-0}"
       echo "  failover      : ${FAILOVER:-unknown}"
       echo "  sync-status   : ${SYNC:-unknown}"
+      echo "  debug:"
+      echo "    show sys failover      : ${DBG_SYS:-}"
+      echo "    show cm failover-status: ${DBG_CM:-}"
+      echo "    show cm traffic-group  : ${DBG_TG:-}"
       echo
     } >> "$TXT_OUT"
-
-    # If still unknown, also log debug
-    if [[ "${FAILOVER:-unknown}" == "unknown" ]]; then
-      DBG1=$(printf "%s\n" "$OUT" | awk -F= '$1=="DBG_SYS_FAILOVER"{print substr($0, index($0,"=")+1)}')
-      DBG2=$(printf "%s\n" "$OUT" | awk -F= '$1=="DBG_CM_FAILOVER"{print substr($0, index($0,"=")+1)}')
-      {
-        echo "  DEBUG:"
-        echo "    show sys failover      : ${DBG1:-}"
-        echo "    show cm failover-status: ${DBG2:-}"
-        echo
-      } >> "$TXT_OUT"
-      echo "⚠️  DEBUG enregistré dans $TXT_OUT (failover=unknown)"
-    fi
 
   else
     echo "❌ Échec SSH/TMSH : $HOST"
