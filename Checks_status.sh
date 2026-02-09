@@ -41,7 +41,7 @@ trim() {
 }
 
 #######################################
-# SSH runner (tmsh interactive)
+# SSH runner
 #######################################
 tmsh_batch() {
   local host="$1"
@@ -59,12 +59,12 @@ EOF
 }
 
 #######################################
-# PARSERS (sur sortie brute)
+# PARSERS
 #######################################
+
 parse_failover() {
   local raw="$1" st=""
 
-  # "Failover active"
   st="$(printf "%s\n" "$raw" | awk 'BEGIN{IGNORECASE=1} $1=="Failover" {print $2; exit}' \
         | tr '[:upper:]' '[:lower:]' || true)"
   st="$(trim "${st:-}")"
@@ -72,7 +72,6 @@ parse_failover() {
     echo "$st"; return 0
   fi
 
-  # "Status ACTIVE" (dans CM::Failover status)
   st="$(printf "%s\n" "$raw" | awk 'BEGIN{IGNORECASE=1} $1=="Status" && ($2=="ACTIVE" || $2=="STANDBY") {print $2; exit}' \
         | tr '[:upper:]' '[:lower:]' || true)"
   st="$(trim "${st:-}")"
@@ -83,30 +82,25 @@ parse_failover() {
   echo "unknown"
 }
 
-# ✅ Sync-status : on PARSE UNIQUEMENT le bloc "CM::Sync Status"
-# Ton format: "Status In Sync" (sans :)
-# + fallback "Status: In Sync"
+# ✅ Sync-status borné au bloc CM::Sync Status
 parse_sync() {
   local raw="$1" s=""
 
   s="$(printf "%s\n" "$raw" | awk '
-      BEGIN{IGNORECASE=1; in=0}
+      BEGIN{IGNORECASE=1; block=0}
 
-      # Entrée dans le bloc
-      /^CM::Sync[[:space:]]+Status/ { in=1; next }
+      /^CM::Sync[[:space:]]+Status/ { block=1; next }
 
-      # Sortie du bloc si un nouveau header "XX::YY" commence
-      in==1 && /^[A-Z][A-Z0-9_-]*::/ { in=0 }
+      block==1 && /^[A-Z][A-Z0-9_-]*::/ { block=0 }
 
-      # Dans le bloc, on cherche la ligne "Status ..."
-      in==1 && /Status[[:space:]]*:/ {
+      block==1 && /Status[[:space:]]*:/ {
         line=$0
         sub(/^.*Status[[:space:]]*:[[:space:]]*/,"",line)
         gsub(/[[:space:]]+/," ",line)
         if(line!=""){ print line; exit }
       }
 
-      in==1 && /^[[:space:]]*Status[[:space:]]+/ {
+      block==1 && /^[[:space:]]*Status[[:space:]]+/ {
         line=$0
         sub(/^[[:space:]]*Status[[:space:]]+/,"",line)
         gsub(/[[:space:]]+/," ",line)
@@ -118,8 +112,6 @@ parse_sync() {
   [[ -n "$s" ]] && echo "$s" || echo "unknown"
 }
 
-# Device-group HA : prendre un DG de type sync-failover
-# Retourne: "DG_NAME|MEMBERS_COUNT" ou vide
 parse_sync_failover_dg() {
   local raw="$1"
   local line dg members
@@ -167,15 +159,8 @@ while IFS= read -r LINE || [[ -n "$LINE" ]]; do
   set -e
 
   if [[ $RC -ne 0 || -z "$(trim "${RAW:-}")" ]]; then
-    echo "❌ Échec récupération infos HA (SSH/TMSH) : $HOST"
+    echo "❌ Échec récupération infos HA : $HOST"
     FAILS=$((FAILS+1))
-    {
-      echo "Host: $HOST"
-      echo "  role : error"
-      echo "  ERROR: SSH/TMSH failed or empty output"
-      echo
-    } >> "$TXT_OUT"
-    echo
     continue
   fi
 
@@ -190,8 +175,6 @@ while IFS= read -r LINE || [[ -n "$LINE" ]]; do
     MEMBERS="$(trim "$MEMBERS")"
     if [[ "${MEMBERS:-0}" =~ ^[0-9]+$ ]] && (( MEMBERS >= 2 )); then
       MODE="cluster"
-    else
-      MODE="standalone"
     fi
   fi
 
@@ -201,7 +184,6 @@ while IFS= read -r LINE || [[ -n "$LINE" ]]; do
     SYNC="$(parse_sync "$RAW")"
   else
     FAILOVER="unknown"
-    SYNC="unknown"
   fi
 
   ROLE="ha-unknown"
@@ -211,7 +193,6 @@ while IFS= read -r LINE || [[ -n "$LINE" ]]; do
     case "$FAILOVER" in
       active)  ROLE="ha-active" ;;
       standby) ROLE="ha-standby" ;;
-      *)       ROLE="ha-unknown" ;;
     esac
   fi
 
