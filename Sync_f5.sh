@@ -32,15 +32,6 @@ trim() {
   printf "%s" "$s"
 }
 
-# Exécute une commande (dans le shell tmsh du compte)
-# Retourne stdout, et le code retour SSH via $?
-ssh_tmsh() {
-  local host="$1"
-  local cmd="$2"
-  sshpass -p "$SSH_PASS" ssh "${SSH_OPTS[@]}" "${SSH_USER}@${host}" "$cmd" 2>/dev/null \
-    | tr -d '\r'
-}
-
 ask_yes_no() {
   local prompt="$1" ans=""
   while true; do
@@ -51,22 +42,48 @@ ask_yes_no() {
     ans="$(printf "%s" "$ans" | tr '[:upper:]' '[:lower:]')"
     case "$ans" in
       y|yes|o|oui) return 0 ;;
-      n|no|non|"") return 1 ;;   # entrée vide => non
+      n|no|non|"") return 1 ;;   # vide => non (anti-boucle)
       *) echo "Répondre y/n" ;;
     esac
   done
 }
 
-parse_failover() {
-  local raw="$1" st=""
+# Ouvre une session tmsh et imprime des sections marquées
+tmsh_capture() {
+  local host="$1"
+  sshpass -p "$SSH_PASS" ssh "${SSH_OPTS[@]}" "${SSH_USER}@${host}" <<'EOF'
+run util bash -c 'echo __SYS_FAILOVER__'
+show sys failover
+run util bash -c 'echo __CM_FAILOVER__'
+show cm failover-status
+run util bash -c 'echo __CM_SYNC__'
+show cm sync-status
+run util bash -c 'echo __DG__'
+list cm device-group
+run util bash -c 'echo __END__'
+quit
+EOF
+}
 
-  # Format : "Failover active"
+# Extrait les lignes entre 2 marqueurs
+section_between() {
+  local raw="$1" start="$2" end="$3"
+  printf "%s\n" "$raw" | awk -v s="$start" -v e="$end" '
+    $0 ~ s {p=1; next}
+    $0 ~ e {p=0}
+    p==1 {print}
+  '
+}
+
+parse_failover_block() {
+  local raw="$1" st=""
+  # "Failover active"
   st="$(printf "%s\n" "$raw" | awk 'BEGIN{IGNORECASE=1} $1=="Failover" {print $2; exit}' \
         | tr '[:upper:]' '[:lower:]' || true)"
   st="$(trim "${st:-}")"
   [[ "$st" == "active" || "$st" == "standby" ]] && { echo "$st"; return 0; }
 
-  # Format : "Status ACTIVE"
+  # "Status ACTIVE"
   st="$(printf "%s\n" "$raw" | awk 'BEGIN{IGNORECASE=1} $1=="Status" && ($2=="ACTIVE" || $2=="STANDBY") {print $2; exit}' \
         | tr '[:upper:]' '[:lower:]' || true)"
   st="$(trim "${st:-}")"
@@ -75,18 +92,16 @@ parse_failover() {
   echo "unknown"
 }
 
-# Tu as : CM::Sync Status ... "Status In Sync"
-parse_sync() {
+parse_sync_block() {
   local raw="$1" s=""
+  # Ton format: "Status In Sync" (sans :)
   s="$(printf "%s\n" "$raw" | awk '
-      BEGIN{IGNORECASE=1; block=0}
-      /^CM::Sync[[:space:]]+Status/ { block=1; next }
-      block==1 && /^[A-Z][A-Z0-9_-]*::/ { block=0 }
-      block==1 && /^[[:space:]]*Status[[:space:]]+/ {
-        line=$0
-        sub(/^[[:space:]]*Status[[:space:]]+/,"",line)
-        gsub(/[[:space:]]+/," ",line)
-        if(line!=""){ print line; exit }
+      BEGIN{IGNORECASE=1}
+      /^[[:space:]]*Status[[:space:]]+/ {
+        sub(/^[[:space:]]*Status[[:space:]]+/,"")
+        gsub(/[[:space:]]+/," ")
+        print
+        exit
       }
     ' || true)"
   s="$(printf "%s" "$s" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
@@ -105,38 +120,40 @@ norm_sync() {
   fi
 }
 
-# Récupère le 1er device-group de type sync-failover + nombre de devices
-# Plus robuste que one-line (pas sensible au wrap)
-get_sync_failover_dg() {
+# Parse le 1er device-group type sync-failover + membres
+parse_sync_failover_dg_block() {
   local raw="$1"
+  # On parse les blocs "cm device-group <name> { ... }" et on prend le premier type sync-failover
   printf "%s\n" "$raw" | awk '
-    BEGIN{IGNORECASE=1; inblk=0; isha=0; name=""; devcount=0; indev=0}
-
+    BEGIN{IGNORECASE=1; inblk=0; isha=0; name=""; indev=0; devcount=0}
     $1=="cm" && $2=="device-group" && $4=="{" {
-      inblk=1; isha=0; name=$3; devcount=0; indev=0; next
+      inblk=1; isha=0; name=$3; indev=0; devcount=0; next
     }
-
     inblk==1 {
       if ($0 ~ /type[[:space:]]+sync-failover/) isha=1
 
-      # devices { ... } peut être multi-lignes
       if ($0 ~ /^[[:space:]]*devices[[:space:]]*{/) { indev=1; next }
-      if (indev==1 && $1=="}") { indev=0 }  # fin devices {}
+      if (indev==1 && $1=="}") { indev=0; next }
 
       if (indev==1) {
-        # compte /Common/deviceX ou /Partition/deviceX
         for (i=1;i<=NF;i++) if ($i ~ /^\/[^[:space:]}]+$/) devcount++
       }
 
       if ($1=="}") {
-        if (isha==1) {
-          printf "%s|%d\n", name, devcount
-          exit
-        }
+        if (isha==1) { printf "%s|%d\n", name, devcount; exit }
         inblk=0
       }
     }
   '
+}
+
+config_sync_to_group() {
+  local host="$1" dg="$2"
+  sshpass -p "$SSH_PASS" ssh "${SSH_OPTS[@]}" "${SSH_USER}@${host}" <<EOF
+run cm config-sync to-group ${dg}
+show cm sync-status
+quit
+EOF
 }
 
 #######################################
@@ -158,21 +175,23 @@ while IFS= read -r LINE || [[ -n "$LINE" ]]; do
   echo "➡️  [$COUNT/$TOTAL] BIG-IP : $HOST"
   echo "======================================"
 
-  # 1) device-group (list multi-lignes)
-  DG_RAW=""
-  DG_RC=0
   set +e
-  DG_RAW="$(ssh_tmsh "$HOST" 'list cm device-group')"
-  DG_RC=$?
+  RAW="$(tmsh_capture "$HOST" 2>&1)"
+  RC=$?
   set -e
 
-  if [[ $DG_RC -ne 0 || -z "$(trim "${DG_RAW:-}")" ]]; then
-    echo "❌ Impossible de lire 'list cm device-group' (SSH/TMSH KO)"
+  if [[ $RC -ne 0 || -z "$(trim "${RAW:-}")" ]]; then
+    echo "❌ SSH/TMSH KO sur $HOST"
     echo
     continue
   fi
 
-  DG_INFO="$(get_sync_failover_dg "$DG_RAW" || true)"
+  SYS_BLOCK="$(section_between "$RAW" "__SYS_FAILOVER__" "__CM_FAILOVER__")"
+  CM_FAIL_BLOCK="$(section_between "$RAW" "__CM_FAILOVER__" "__CM_SYNC__")"
+  SYNC_BLOCK="$(section_between "$RAW" "__CM_SYNC__" "__DG__")"
+  DG_BLOCK="$(section_between "$RAW" "__DG__" "__END__")"
+
+  DG_INFO="$(parse_sync_failover_dg_block "$DG_BLOCK" || true)"
   DG="none"; MEMBERS="0"; MODE="standalone"
 
   if [[ -n "$(trim "${DG_INFO:-}")" ]]; then
@@ -189,40 +208,16 @@ while IFS= read -r LINE || [[ -n "$LINE" ]]; do
   ROLE="standalone"
 
   if [[ "$MODE" == "cluster" ]]; then
-    # 2) failover
-    SYS_FAIL=""
-    CM_FAIL=""
-    set +e
-    SYS_FAIL="$(ssh_tmsh "$HOST" 'show sys failover')"
-    SYS_RC=$?
-    set -e
-    if [[ $SYS_RC -eq 0 && -n "$(trim "${SYS_FAIL:-}")" ]]; then
-      FAILOVER="$(parse_failover "$SYS_FAIL")"
-    else
-      set +e
-      CM_FAIL="$(ssh_tmsh "$HOST" 'show cm failover-status')"
-      CM_RC=$?
-      set -e
-      [[ $CM_RC -eq 0 ]] && FAILOVER="$(parse_failover "$CM_FAIL")"
-    fi
+    FAILOVER="$(parse_failover_block "$SYS_BLOCK")"
+    [[ "$FAILOVER" == "unknown" ]] && FAILOVER="$(parse_failover_block "$CM_FAIL_BLOCK")"
+
+    SYNC="$(parse_sync_block "$SYNC_BLOCK")"
 
     case "$FAILOVER" in
       active) ROLE="ha-active" ;;
       standby) ROLE="ha-standby" ;;
       *) ROLE="ha-unknown" ;;
     esac
-
-    # 3) sync-status
-    SYNC_RAW=""
-    set +e
-    SYNC_RAW="$(ssh_tmsh "$HOST" 'show cm sync-status')"
-    SYNC_RC=$?
-    set -e
-    if [[ $SYNC_RC -eq 0 && -n "$(trim "${SYNC_RAW:-}")" ]]; then
-      SYNC="$(parse_sync "$SYNC_RAW")"
-    else
-      SYNC="unknown"
-    fi
   fi
 
   SYNC_NORM="$(norm_sync "$SYNC")"
@@ -234,20 +229,16 @@ while IFS= read -r LINE || [[ -n "$LINE" ]]; do
   echo "failover     : $FAILOVER"
   echo "sync-status  : $SYNC  ($SYNC_NORM)"
 
-  # ✅ Proposition synchro uniquement ACTIVE + out-of-sync + DG valide
+  # Proposition synchro uniquement ACTIVE + out-of-sync
   if [[ "$MODE" == "cluster" && "$DG" != "none" && "$ROLE" == "ha-active" && "$SYNC_NORM" == "out-of-sync" ]]; then
     echo
     echo "⚠️  Device-group non synchronisé."
     if ask_yes_no "➡️  Lancer 'run cm config-sync to-group ${DG}' sur ${HOST} ?"; then
       echo "⏳ Lancement config-sync..."
-      set +e
-      RES1="$(ssh_tmsh "$HOST" "run cm config-sync to-group ${DG}")"
-      RES2="$(ssh_tmsh "$HOST" "show cm sync-status")"
-      set -e
-      echo "✅ Commande envoyée."
-      echo "Nouveau sync-status :"
+      RES="$(config_sync_to_group "$HOST" "$DG" 2>&1 || true)"
+      echo "✅ Commande envoyée. Retour:"
       echo "--------------------------------------"
-      echo "$RES2" | sed -n '1,120p'
+      echo "$RES" | sed -n '1,160p'
       echo "--------------------------------------"
     else
       echo "⏭️  Synchronisation ignorée."
