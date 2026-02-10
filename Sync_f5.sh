@@ -5,7 +5,6 @@ set -euo pipefail
 # CONFIG
 #######################################
 DEVICES_FILE="devices.txt"
-
 SSH_OPTS=(-tt -o StrictHostKeyChecking=no -o ConnectTimeout=15 -o LogLevel=Error)
 
 #######################################
@@ -44,7 +43,6 @@ quit
 EOF
 }
 
-# retourne "DG_NAME|MEMBERS" pour le 1er DG sync-failover trouvé
 parse_sync_failover_dg() {
   local raw="$1" line dg members
   line="$(printf "%s\n" "$raw" | awk '
@@ -66,6 +64,7 @@ parse_sync_failover_dg() {
 
 parse_failover() {
   local raw="$1" st=""
+
   st="$(printf "%s\n" "$raw" | awk 'BEGIN{IGNORECASE=1} $1=="Failover" {print $2; exit}' \
         | tr '[:upper:]' '[:lower:]' || true)"
   st="$(trim "${st:-}")"
@@ -83,7 +82,6 @@ parse_failover() {
   echo "unknown"
 }
 
-# parse uniquement le bloc CM::Sync Status
 parse_sync() {
   local raw="$1" s=""
   s="$(printf "%s\n" "$raw" | awk '
@@ -107,7 +105,6 @@ parse_sync() {
   [[ -n "$s" ]] && echo "$s" || echo "unknown"
 }
 
-# normalise "In Sync" -> in-sync
 norm_sync() {
   local s
   s="$(printf "%s" "$1" | tr '[:upper:]' '[:lower:]')"
@@ -120,28 +117,31 @@ norm_sync() {
   fi
 }
 
-config_sync_to_group() {
-  local host="$1"
-  local dg="$2"
+ask_yes_no() {
+  local prompt="$1" ans=""
+  while true; do
+    # read peut échouer (EOF) -> on considère "non"
+    if ! read -rp "$prompt [y/n] : " ans; then
+      echo
+      return 1
+    fi
 
-  # Exécution en tmsh (user arrive en tmsh)
+    ans="$(printf "%s" "$ans" | tr '[:upper:]' '[:lower:]')"
+    case "$ans" in
+      y|yes|o|oui) return 0 ;;
+      n|no|non|"") return 1 ;;   # entrée vide => non (évite boucle)
+      *) echo "Répondre y/n" ;;
+    esac
+  done
+}
+
+config_sync_to_group() {
+  local host="$1" dg="$2"
   sshpass -p "$SSH_PASS" ssh "${SSH_OPTS[@]}" "${SSH_USER}@${host}" <<EOF 2>/dev/null | tr -d '\r'
 run cm config-sync to-group ${dg}
 show cm sync-status
 quit
 EOF
-}
-
-ask_yes_no() {
-  local prompt="$1" ans
-  while true; do
-    read -rp "$prompt [y/n] : " ans
-    case "$(printf "%s" "$ans" | tr '[:upper:]' '[:lower:]')" in
-      y|yes|o|oui) return 0 ;;
-      n|no|non) return 1 ;;
-      *) echo "Répondre y/n" ;;
-    esac
-  done
 }
 
 #######################################
@@ -151,7 +151,7 @@ TOTAL=$(grep -Ev '^\s*#|^\s*$' "$DEVICES_FILE" | wc -l | awk '{print $1}')
 COUNT=0
 
 echo
-echo "🔎 Check HA + proposition de synchronisation (device-group)"
+echo "🔎 Check HA + proposition de synchronisation (uniquement sur ACTIVE)"
 echo
 
 while IFS= read -r LINE || [[ -n "$LINE" ]]; do
@@ -205,23 +205,23 @@ while IFS= read -r LINE || [[ -n "$LINE" ]]; do
   echo "failover     : $FAILOVER"
   echo "sync-status  : $SYNC  ($SYNC_NORM)"
 
-  # Proposition de sync
+  # ✅ Proposer la synchro UNIQUEMENT sur ACTIVE + out-of-sync
   if [[ "$MODE" == "cluster" && "$DG" != "none" && "$SYNC_NORM" == "out-of-sync" ]]; then
     echo
-    echo "⚠️  Device-group non synchronisé."
     if [[ "$ROLE" != "ha-active" ]]; then
-      echo "ℹ️  Note: ce device n'est pas détecté comme ACTIVE. La synchro est en général lancée depuis l'ACTIVE."
-    fi
-
-    if ask_yes_no "➡️  Lancer 'run cm config-sync to-group ${DG}' sur ${HOST} ?"; then
-      echo "⏳ Lancement config-sync..."
-      RES="$(config_sync_to_group "$HOST" "$DG" || true)"
-      echo "✅ Commande envoyée. Nouveau sync-status (si visible) :"
-      echo "--------------------------------------"
-      echo "$RES" | sed -n '1,120p'
-      echo "--------------------------------------"
+      echo "ℹ️  Non proposé: l'équipement n'est pas ACTIVE."
     else
-      echo "⏭️  Synchronisation ignorée."
+      echo "⚠️  Device-group non synchronisé."
+      if ask_yes_no "➡️  Lancer 'run cm config-sync to-group ${DG}' sur ${HOST} ?"; then
+        echo "⏳ Lancement config-sync..."
+        RES="$(config_sync_to_group "$HOST" "$DG" || true)"
+        echo "✅ Commande envoyée. Nouveau sync-status (si visible) :"
+        echo "--------------------------------------"
+        echo "$RES" | sed -n '1,120p'
+        echo "--------------------------------------"
+      else
+        echo "⏭️  Synchronisation ignorée."
+      fi
     fi
   fi
 
