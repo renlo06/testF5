@@ -1,30 +1,18 @@
 #!/usr/bin/env bash
 set -uo pipefail
 
-#######################################
-# CONFIG
-#######################################
 DEVICES_FILE="devices.txt"
 SSH_OPTS=(-tt -o StrictHostKeyChecking=no -o ConnectTimeout=15 -o LogLevel=Error)
 
-#######################################
-# PRECHECKS
-#######################################
 for bin in ssh sshpass awk sed grep wc tr; do
   command -v "$bin" >/dev/null || { echo "❌ $bin requis"; exit 1; }
 done
 [[ -f "$DEVICES_FILE" ]] || { echo "❌ Fichier équipements introuvable : $DEVICES_FILE"; exit 1; }
 
-#######################################
-# INPUTS
-#######################################
 read -rp "Utilisateur SSH (compte qui arrive en tmsh): " SSH_USER
 read -s -rp "Mot de passe SSH: " SSH_PASS
 echo
 
-#######################################
-# HELPERS
-#######################################
 trim() {
   local s="$1"
   s="${s#"${s%%[![:space:]]*}"}"
@@ -42,13 +30,13 @@ ask_yes_no() {
     ans="$(printf "%s" "$ans" | tr '[:upper:]' '[:lower:]')"
     case "$ans" in
       y|yes|o|oui) return 0 ;;
-      n|no|non|"") return 1 ;;   # vide => non (anti-boucle)
+      n|no|non|"") return 1 ;;
       *) echo "Répondre y/n" ;;
     esac
   done
 }
 
-# Ouvre une session tmsh et imprime des sections marquées
+# Session tmsh + marqueurs (les marqueurs peuvent être préfixés par le prompt)
 tmsh_capture() {
   local host="$1"
   sshpass -p "$SSH_PASS" ssh "${SSH_OPTS[@]}" "${SSH_USER}@${host}" <<'EOF'
@@ -65,46 +53,49 @@ quit
 EOF
 }
 
-# Extrait les lignes entre 2 marqueurs
+# Extrait entre marqueurs même si le prompt est devant
 section_between() {
   local raw="$1" start="$2" end="$3"
   printf "%s\n" "$raw" | awk -v s="$start" -v e="$end" '
-    $0 ~ s {p=1; next}
-    $0 ~ e {p=0}
+    index($0,s)>0 {p=1; next}
+    index($0,e)>0 {p=0}
     p==1 {print}
   '
 }
 
+# Parse failover en matchant dans la ligne (prompt tolerant)
 parse_failover_block() {
-  local raw="$1" st=""
-  # "Failover active"
-  st="$(printf "%s\n" "$raw" | awk 'BEGIN{IGNORECASE=1} $1=="Failover" {print $2; exit}' \
-        | tr '[:upper:]' '[:lower:]' || true)"
+  local raw="$1"
+  # Cherche "Failover active|standby" n'importe où dans la ligne
+  local st
+  st="$(printf "%s\n" "$raw" | awk '
+    BEGIN{IGNORECASE=1}
+    {
+      if (match($0, /Failover[[:space:]]+(active|standby)/, m)) { print tolower(m[1]); exit }
+      if (match($0, /Status[[:space:]]+(ACTIVE|STANDBY)/, m)) { print tolower(m[1]); exit }
+    }
+  ' || true)"
   st="$(trim "${st:-}")"
-  [[ "$st" == "active" || "$st" == "standby" ]] && { echo "$st"; return 0; }
-
-  # "Status ACTIVE"
-  st="$(printf "%s\n" "$raw" | awk 'BEGIN{IGNORECASE=1} $1=="Status" && ($2=="ACTIVE" || $2=="STANDBY") {print $2; exit}' \
-        | tr '[:upper:]' '[:lower:]' || true)"
-  st="$(trim "${st:-}")"
-  [[ "$st" == "active" || "$st" == "standby" ]] && { echo "$st"; return 0; }
-
-  echo "unknown"
+  [[ "$st" == "active" || "$st" == "standby" ]] && echo "$st" || echo "unknown"
 }
 
+# Ton format sync: "Status In Sync" (dans le bloc CM::Sync Status)
 parse_sync_block() {
-  local raw="$1" s=""
-  # Ton format: "Status In Sync" (sans :)
+  local raw="$1"
+  local s
   s="$(printf "%s\n" "$raw" | awk '
-      BEGIN{IGNORECASE=1}
-      /^[[:space:]]*Status[[:space:]]+/ {
-        sub(/^[[:space:]]*Status[[:space:]]+/,"")
-        gsub(/[[:space:]]+/," ")
-        print
+    BEGIN{IGNORECASE=1; block=0}
+    /^CM::Sync[[:space:]]+Status/ {block=1; next}
+    block==1 && /^[A-Z][A-Z0-9_-]*::/ {block=0}
+    block==1 {
+      if (match($0, /^[[:space:]]*Status[[:space:]]+(.+)$/, m)) {
+        gsub(/[[:space:]]+/," ",m[1])
+        print m[1]
         exit
       }
-    ' || true)"
-  s="$(printf "%s" "$s" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+    }
+  ' || true)"
+  s="$(printf "%s" "${s:-}" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
   [[ -n "$s" ]] && echo "$s" || echo "unknown"
 }
 
@@ -120,10 +111,9 @@ norm_sync() {
   fi
 }
 
-# Parse le 1er device-group type sync-failover + membres
+# Parse le 1er device-group type sync-failover + nb membres
 parse_sync_failover_dg_block() {
   local raw="$1"
-  # On parse les blocs "cm device-group <name> { ... }" et on prend le premier type sync-failover
   printf "%s\n" "$raw" | awk '
     BEGIN{IGNORECASE=1; inblk=0; isha=0; name=""; indev=0; devcount=0}
     $1=="cm" && $2=="device-group" && $4=="{" {
@@ -144,7 +134,7 @@ parse_sync_failover_dg_block() {
         inblk=0
       }
     }
-  '
+  ' || true
 }
 
 config_sync_to_group() {
@@ -156,9 +146,6 @@ quit
 EOF
 }
 
-#######################################
-# MAIN
-#######################################
 TOTAL=$(grep -Ev '^\s*#|^\s*$' "$DEVICES_FILE" | wc -l | awk '{print $1}')
 COUNT=0
 
@@ -210,7 +197,6 @@ while IFS= read -r LINE || [[ -n "$LINE" ]]; do
   if [[ "$MODE" == "cluster" ]]; then
     FAILOVER="$(parse_failover_block "$SYS_BLOCK")"
     [[ "$FAILOVER" == "unknown" ]] && FAILOVER="$(parse_failover_block "$CM_FAIL_BLOCK")"
-
     SYNC="$(parse_sync_block "$SYNC_BLOCK")"
 
     case "$FAILOVER" in
@@ -229,7 +215,6 @@ while IFS= read -r LINE || [[ -n "$LINE" ]]; do
   echo "failover     : $FAILOVER"
   echo "sync-status  : $SYNC  ($SYNC_NORM)"
 
-  # Proposition synchro uniquement ACTIVE + out-of-sync
   if [[ "$MODE" == "cluster" && "$DG" != "none" && "$ROLE" == "ha-active" && "$SYNC_NORM" == "out-of-sync" ]]; then
     echo
     echo "⚠️  Device-group non synchronisé."
