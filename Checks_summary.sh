@@ -5,7 +5,7 @@ DEVICES_FILE="devices.txt"
 TOP=10000
 CURL_OPTS=(-k -sS --connect-timeout 10 --max-time 30)
 
-for bin in curl jq awk tr grep wc; do
+for bin in curl jq awk tr grep wc sed; do
   command -v "$bin" >/dev/null || { echo "❌ $bin requis"; exit 1; }
 done
 [[ -f "$DEVICES_FILE" ]] || { echo "❌ Fichier équipements introuvable : $DEVICES_FILE"; exit 1; }
@@ -42,43 +42,55 @@ rest_get_or_empty() {
 }
 
 #######################################
-# JQ HELPERS
+# JQ HELPERS (partition-aware)
 #######################################
-# Build fullPath->availability map from */stats
-stats_to_avail_map_jq='
-  def key_to_fullpath:
-    ( . | capture("~(?<p>[^~]+)~(?<n>[^/]+)")? )
-    | if . == null then null else ("/" + .p + "/" + .n) end;
+# Convertit une clé stats du type:
+#   "https://localhost/mgmt/tm/ltm/virtual/~Common~vs1/stats"
+# ou "~Common~vs1~stats"
+# ou "~Common~pool1~members~10.0.0.1:80~stats"
+# => "/Common/vs1" ou "/Common/pool1/members/10.0.0.1:80"
+stats_key_to_fullpath_jq='
+  def to_fullpath:
+    tostring
+    | sub("^.*/~"; "~")                         # garde à partir du "~"
+    | sub("/stats$"; "~stats")                  # uniformise
+    | sub("~stats$"; "")                        # enlève le suffixe stats
+    | sub("^~"; "")                             # enlève le 1er ~
+    | gsub("~"; "/")                            # ~ -> /
+    | "/" + .                                   # préfixe /
+  ;
+  to_fullpath
+'
 
-  # ✅ supporte plusieurs layouts BIG-IP:
-  # - nestedStats.entries.status.availabilityState.description
-  # - nestedStats.entries.status.entries.availabilityState.description
-  # - nestedStats.entries.*availabilityState.description
-  # - nestedStats.entries.*status_availabilityState.description
+# Extraction availability robuste sur BIG-IP
+pick_avail_jq='
   def pick_avail($e):
     (
       $e.nestedStats.entries.status.availabilityState.description? //
       $e.nestedStats.entries.status.entries.availabilityState.description? //
       $e.nestedStats.entries.availabilityState.description? //
       $e.nestedStats.entries.status_availabilityState.description? //
-      $e.nestedStats.entries.status?.description? //
-      # fallback: 1er "description" dont la clé contient availabilityState
       (
         $e.nestedStats.entries
         | to_entries[]
         | select(.key | test("availabilityState";"i"))
         | .value.description?
       ) //
-      empty
+      "UNKNOWN"
     );
-
-  reduce (.entries // {} | to_entries[]) as $it ({}; 
-    ($it.key | key_to_fullpath) as $fp
-    | if $fp == null then .
-      else . + { ($fp): (pick_avail($it.value) // "UNKNOWN") }
-      end
-  )
+  pick_avail(.)
 '
+
+# Build fullPath->availability map from */stats (partition-aware)
+stats_to_avail_map_jq="
+  def key_to_fullpath: ($stats_key_to_fullpath_jq);
+  def pick_avail(\$e): ($pick_avail_jq);
+
+  reduce (.entries // {} | to_entries[]) as \$it ({}; 
+    (\$it.key | key_to_fullpath) as \$fp
+    | . + { (\$fp): (pick_avail(\$it.value) // \"UNKNOWN\") }
+  )
+"
 
 count_status_tsv_jq='
   def is_up($s): ($s | ascii_upcase | test("AVAILABLE|UP"));
@@ -98,52 +110,48 @@ count_status_tsv_jq='
     ] | @tsv
 '
 
-#######################################
-# POOL MEMBERS COUNTER (from stats entries)
-#######################################
+# Pool members counts from stats entries (partition-aware)
 pool_members_counts_from_stats() {
-  jq -r '
-    def key_to_fullpath:
-      ( . | capture("~(?<p>[^~]+)~(?<n>[^/]+)")? )
-      | if . == null then null else ("/" + .p + "/" + .n) end;
+  jq -r "
+    def key_to_fullpath: ($stats_key_to_fullpath_jq);
 
-    def pick_avail($e):
+    def pick_avail(\$e):
       (
-        $e.nestedStats.entries.status.availabilityState.description? //
-        $e.nestedStats.entries.status.entries.availabilityState.description? //
-        $e.nestedStats.entries.availabilityState.description? //
-        $e.nestedStats.entries.status_availabilityState.description? //
+        \$e.nestedStats.entries.status.availabilityState.description? //
+        \$e.nestedStats.entries.status.entries.availabilityState.description? //
+        \$e.nestedStats.entries.availabilityState.description? //
+        \$e.nestedStats.entries.status_availabilityState.description? //
         (
-          $e.nestedStats.entries
+          \$e.nestedStats.entries
           | to_entries[]
-          | select(.key | test("availabilityState";"i"))
+          | select(.key | test(\"availabilityState\";\"i\"))
           | .value.description?
         ) //
-        "UNKNOWN"
+        \"UNKNOWN\"
       );
 
-    def is_up($s): ($s | ascii_upcase | test("AVAILABLE|UP"));
-    def st($s):
-      if $s == null or ($s|ascii_upcase) == "UNKNOWN" then "unknown"
-      elif is_up($s) then "up"
-      else "down" end;
+    def is_up(\$s): (\$s | ascii_upcase | test(\"AVAILABLE|UP\"));
+    def st(\$s):
+      if \$s == null or (\$s|ascii_upcase) == \"UNKNOWN\" then \"unknown\"
+      elif is_up(\$s) then \"up\"
+      else \"down\" end;
 
-    (.entries // {} | to_entries) as $e
-    | ($e
+    (.entries // {} | to_entries) as \$e
+    | (\$e
         | map({
-            fullPath: (key_to_fullpath(.key) // ""),
+            fullPath: (key_to_fullpath(.key) // \"\"),
             avail: pick_avail(.value)
           })
-        | map(select(.fullPath != ""))
-      ) as $items
-    | ($items | length) as $total
-    | ($items | map(st(.avail))) as $st
-    | [ $total,
-        ($st | map(select(.=="up")) | length),
-        ($st | map(select(.=="down")) | length),
-        ($st | map(select(.=="unknown")) | length)
+        | map(select(.fullPath != \"\"))
+      ) as \$items
+    | (\$items | length) as \$total
+    | (\$items | map(st(.avail))) as \$st
+    | [ \$total,
+        (\$st | map(select(.==\"up\")) | length),
+        (\$st | map(select(.==\"down\")) | length),
+        (\$st | map(select(.==\"unknown\")) | length)
       ] | @tsv
-  ' 2>/dev/null
+  " 2>/dev/null
 }
 
 #######################################
@@ -153,7 +161,7 @@ TOTAL=$(grep -Ev '^\s*#|^\s*$' "$DEVICES_FILE" | wc -l | awk '{print $1}')
 COUNT=0
 
 echo
-echo "📊 Summary LTM/ASM/AFM (REST) — par équipement"
+echo "📊 Summary LTM/ASM/AFM (REST) — partitions OK"
 echo
 
 while IFS= read -r LINE || [[ -n "$LINE" ]]; do
