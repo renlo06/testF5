@@ -49,9 +49,9 @@ rest_get_or_empty() {
 }
 
 #######################################
-# JQ HELPERS (fast stats scanning)
+# JQ HELPERS (robust)
 #######################################
-# Convert stats key to fullPath (partition-aware)
+# Key stats -> fullPath (/Common/obj[/...]) (partition-aware)
 stats_key_to_fullpath_jq='
   tostring
   | sub("^.*/~"; "~")
@@ -62,7 +62,7 @@ stats_key_to_fullpath_jq='
   | "/" + .
 '
 
-# ✅ availability is exposed as "status.availabilityState" on your systems
+# Availability extraction for your format: status.availabilityState
 pick_avail_scan_jq='
   (
     .nestedStats.entries["status.availabilityState"].description?
@@ -76,38 +76,10 @@ pick_avail_scan_jq='
   ) // "UNKNOWN"
 '
 
-# Count up/down/unknown directly from stats payload (NO cfg call)
-# - Filters objects by "kind" signature
-# - For VS: kind contains "ltm:virtual"
-# - For Pools: kind contains "ltm:pool"
-count_from_stats_jq='
-  def key_to_fullpath: '"$stats_key_to_fullpath_jq"' ;
-  def pick_avail($e): '"$pick_avail_scan_jq"' ;
-
-  def is_up($s): ($s | ascii_upcase | test("AVAILABLE|UP"));
-  def st($s):
-    if $s == null or ($s|ascii_upcase) == "UNKNOWN" then "unknown"
-    elif is_up($s) then "up"
-    else "down" end;
-
-  def counts_for_kind($needle):
-    (.entries // {} | to_entries
-      | map(select(.value.kind? | tostring | test($needle;"i")))
-      | map({ fp: (key_to_fullpath(.key)), a: (pick_avail(.value)) })
-    ) as $items
-    | ($items | length) as $total
-    | ($items | map(st(.a))) as $st
-    | [ $total,
-        ($st | map(select(.=="up")) | length),
-        ($st | map(select(.=="down")) | length),
-        ($st | map(select(.=="unknown")) | length)
-      ] | @tsv;
-
-  counts_for_kind($KIND)
-'
-
-# Pool members counts directly from /members/stats (no cfg call)
-count_pool_members_from_stats_jq='
+# Count up/down/unknown directly from a stats payload (filtering by key pattern)
+# args:
+#  - $KRE : regex to identify object entries in .entries keys
+count_from_stats_by_key_jq='
   def key_to_fullpath: '"$stats_key_to_fullpath_jq"' ;
   def pick_avail($e): '"$pick_avail_scan_jq"' ;
 
@@ -118,6 +90,7 @@ count_pool_members_from_stats_jq='
     else "down" end;
 
   (.entries // {} | to_entries
+    | map(select(.key | test($KRE)))
     | map({ fp: (key_to_fullpath(.key)), a: (pick_avail(.value)) })
   ) as $items
   | ($items | length) as $total
@@ -137,12 +110,7 @@ COUNT=0
 
 echo
 echo "📊 Summary LTM/ASM/AFM (REST) — version finale (moins de requêtes)"
-echo "📌 Requêtes par équipement :"
-echo "   - 1x /ltm/virtual/stats"
-echo "   - 1x /ltm/pool/stats"
-echo "   - 1x /ltm/pool/members/stats"
-echo "   - 1x /asm/policies"
-echo "   - 1x /security/firewall/policy"
+echo "📌 Requêtes par équipement : 5 (VS stats, Pool stats, Members stats, ASM, AFM)"
 echo
 
 while IFS= read -r LINE || [[ -n "$LINE" ]]; do
@@ -154,19 +122,19 @@ while IFS= read -r LINE || [[ -n "$LINE" ]]; do
   echo "➡️  [$COUNT/$TOTAL] BIG-IP : $HOST"
   echo "======================================"
 
-  # 1) VS stats only
+  # 1) VS stats
   VS_STATS="$(rest_get_or_empty "$HOST" "/mgmt/tm/ltm/virtual/stats?\$top=${TOP}" || true)"
-  VS_COUNTS="$(jq --arg KIND "ltm:virtual" -r "$count_from_stats_jq" <<<"$VS_STATS" 2>/dev/null || echo $'0\t0\t0\t0')"
+  VS_COUNTS="$(jq --arg KRE "/mgmt/tm/ltm/virtual/~" -r "$count_from_stats_by_key_jq" <<<"$VS_STATS" 2>/dev/null || echo $'0\t0\t0\t0')"
   IFS=$'\t' read -r VS_TOTAL VS_UP VS_DOWN VS_UNK <<<"$VS_COUNTS"
 
-  # 2) Pool stats only
+  # 2) POOL stats
   POOL_STATS="$(rest_get_or_empty "$HOST" "/mgmt/tm/ltm/pool/stats?\$top=${TOP}" || true)"
-  POOL_COUNTS="$(jq --arg KIND "ltm:pool" -r "$count_from_stats_jq" <<<"$POOL_STATS" 2>/dev/null || echo $'0\t0\t0\t0')"
+  POOL_COUNTS="$(jq --arg KRE "/mgmt/tm/ltm/pool/~" -r "$count_from_stats_by_key_jq" <<<"$POOL_STATS" 2>/dev/null || echo $'0\t0\t0\t0')"
   IFS=$'\t' read -r POOL_TOTAL POOL_UP POOL_DOWN POOL_UNK <<<"$POOL_COUNTS"
 
-  # 3) Pool members stats only
+  # 3) POOL MEMBERS stats (keys contiennent /members/~...)
   PM_STATS="$(rest_get_or_empty "$HOST" "/mgmt/tm/ltm/pool/members/stats?\$top=${TOP}" || true)"
-  PM_COUNTS="$(jq -r "$count_pool_members_from_stats_jq" <<<"$PM_STATS" 2>/dev/null || echo $'0\t0\t0\t0')"
+  PM_COUNTS="$(jq --arg KRE "/mgmt/tm/ltm/pool/members/~" -r "$count_from_stats_by_key_jq" <<<"$PM_STATS" 2>/dev/null || echo $'0\t0\t0\t0')"
   IFS=$'\t' read -r PM_TOTAL PM_UP PM_DOWN PM_UNK <<<"$PM_COUNTS"
 
   # 4) ASM policies count
