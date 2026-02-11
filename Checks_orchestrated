@@ -5,60 +5,54 @@ set -euo pipefail
 # CONFIG
 #######################################
 DEVICES_FILE="devices.txt"
-CURL_OPTS=(-k -sS --fail)
+CURL_OPTS=(-k -sS --connect-timeout 10 --max-time 20)
 
 #######################################
 # PRECHECKS
 #######################################
-for bin in ssh sshpass curl grep awk wc tr; do
+for bin in curl jq awk tr grep wc; do
   command -v "$bin" >/dev/null || { echo "❌ $bin requis"; exit 1; }
 done
-
 [[ -f "$DEVICES_FILE" ]] || { echo "❌ Fichier équipements introuvable : $DEVICES_FILE"; exit 1; }
 
 #######################################
 # INPUTS
 #######################################
-read -rp "Utilisateur SSH (tmsh): " SSH_USER
-read -s -rp "Mot de passe SSH: " SSH_PASS
+read -rp "Utilisateur API (REST, ex: admin): " API_USER
+read -s -rp "Mot de passe API (REST): " API_PASS
 echo
-
-read -rp "Utilisateur API (REST): " API_USER
-read -s -rp "Mot de passe API: " API_PASS
-echo
-
 AUTH=(-u "${API_USER}:${API_PASS}")
 
 #######################################
 # HELPERS
 #######################################
-check_rest() {
-  local host="$1"
-  local endpoint="$2"
-
-  if curl "${CURL_OPTS[@]}" "${AUTH[@]}" \
-       "https://${host}${endpoint}" >/dev/null 2>&1; then
-    echo "OK"
-  else
-    echo "KO"
-  fi
+trim_line() {
+  printf "%s" "$1" | tr -d '\r' | awk '{$1=$1;print}'
 }
 
-check_ui_text() {
+# Teste un endpoint REST (HTTP 2xx = OK)
+rest_ok() {
+  local host="$1" path="$2"
+  curl "${CURL_OPTS[@]}" "${AUTH[@]}" \
+    --fail \
+    "https://${host}${path}" >/dev/null 2>&1
+}
+
+# Récupère une valeur texte de sys db ui.advisory.text via REST
+get_ui_advisory_text() {
   local host="$1"
-
-  OUTPUT=$(sshpass -p "$SSH_PASS" ssh -tt \
-    -o StrictHostKeyChecking=no \
-    -o ConnectTimeout=10 \
-    -o LogLevel=Error \
-    "${SSH_USER}@${host}" \
-    "list sys db ui.advisory.text" 2>/dev/null | tr -d '\r')
-
-  if echo "$OUTPUT" | grep -q "Orchestrated Device"; then
-    echo "OK"
-  else
-    echo "KO"
-  fi
+  # endpoint typique : /mgmt/tm/sys/db/ui.advisory.text
+  # selon versions, la valeur peut être .value ou nestedStats.description
+  curl "${CURL_OPTS[@]}" "${AUTH[@]}" \
+    "https://${host}/mgmt/tm/sys/db/ui.advisory.text" 2>/dev/null \
+  | jq -r '
+      .value? //
+      .defaultValue? //
+      .valueString? //
+      .nestedStats.entries.value.description? //
+      .nestedStats.entries.defaultValue.description? //
+      empty
+    ' 2>/dev/null
 }
 
 #######################################
@@ -66,30 +60,63 @@ check_ui_text() {
 #######################################
 TOTAL=$(grep -Ev '^\s*#|^\s*$' "$DEVICES_FILE" | wc -l | awk '{print $1}')
 COUNT=0
+FAILS=0
 
 echo
-echo "🔎 Vérification AS3 / Service Discovery / Orchestrated Device"
+echo "🔎 Checks Orchestrated (AS3 / Service Discovery / Orchestrated Device)"
 echo
 
 while IFS= read -r LINE || [[ -n "$LINE" ]]; do
-  HOST=$(echo "$LINE" | tr -d '\r' | awk '{$1=$1;print}')
+  HOST="$(trim_line "$LINE")"
   [[ -z "$HOST" || "$HOST" =~ ^# ]] && continue
-
   COUNT=$((COUNT+1))
 
   echo "======================================"
   echo "➡️  [$COUNT/$TOTAL] BIG-IP : $HOST"
   echo "======================================"
 
-  AS3_STATUS=$(check_rest "$HOST" "/mgmt/shared/appsvcs/info")
-  SD_STATUS=$(check_rest "$HOST" "/mgmt/shared/service-discovery/task")
-  UI_STATUS=$(check_ui_text "$HOST")
+  HOST_FAIL=0
 
-  echo "AS3                 : $AS3_STATUS"
-  echo "Service Discovery   : $SD_STATUS"
-  echo "Orchestrated Device : $UI_STATUS"
+  # 1) AS3 info
+  if rest_ok "$HOST" "/mgmt/shared/appsvcs/info"; then
+    echo "AS3                 : ✅ OK"
+  else
+    echo "AS3                 : ❌ KO"
+    HOST_FAIL=1
+  fi
+
+  # 2) Service Discovery task endpoint
+  if rest_ok "$HOST" "/mgmt/shared/service-discovery/task"; then
+    echo "Service Discovery   : ✅ OK"
+  else
+    echo "Service Discovery   : ❌ KO"
+    HOST_FAIL=1
+  fi
+
+  # 3) Orchestrated Device in ui.advisory.text
+  ADV_TEXT="$(get_ui_advisory_text "$HOST" || true)"
+  if [[ -n "${ADV_TEXT:-}" ]] && grep -qi "Orchestrated Device" <<<"$ADV_TEXT"; then
+    echo "Orchestrated Device : ✅ OK (ui.advisory.text)"
+  else
+    echo "Orchestrated Device : ❌ KO (ui.advisory.text)"
+    HOST_FAIL=1
+  fi
+
+  if [[ "$HOST_FAIL" -eq 1 ]]; then
+    FAILS=$((FAILS+1))
+    echo "➡️  Verdict $HOST : ❌ KO"
+  else
+    echo "➡️  Verdict $HOST : ✅ OK"
+  fi
+
   echo
-
 done < "$DEVICES_FILE"
 
-echo "🏁 Vérification terminée"
+echo "======================================"
+echo "🏁 Terminé"
+echo "Équipements traités : $COUNT"
+echo "Équipements en KO   : $FAILS"
+echo "======================================"
+
+# Exit code non-zero si au moins un KO, mais seulement à la fin
+(( FAILS == 0 )) || exit 1
