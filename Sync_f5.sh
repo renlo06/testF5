@@ -1,32 +1,20 @@
 #!/usr/bin/env bash
 set -uo pipefail
 
-#######################################
-# CONFIG
-#######################################
 DEVICES_FILE="devices.txt"
 CURL_BASE=(-k -sS --connect-timeout 10 --max-time 30)
 TOP=10000
 
-#######################################
-# PRECHECKS
-#######################################
-for bin in curl jq awk sed grep wc tr; do
+for bin in curl jq awk grep wc tr; do
   command -v "$bin" >/dev/null || { echo "❌ $bin requis"; exit 1; }
 done
 [[ -f "$DEVICES_FILE" ]] || { echo "❌ Fichier équipements introuvable : $DEVICES_FILE"; exit 1; }
 
-#######################################
-# INPUTS
-#######################################
 read -rp "Utilisateur API (REST, ex: admin): " API_USER
 read -s -rp "Mot de passe API (REST): " API_PASS
 echo
 AUTH=(-u "${API_USER}:${API_PASS}")
 
-#######################################
-# HELPERS
-#######################################
 trim() {
   local s="$1"
   s="${s#"${s%%[![:space:]]*}"}"
@@ -34,20 +22,18 @@ trim() {
   printf "%s" "$s"
 }
 
-ask_yes_no() {
+# ✅ Une seule question, sinon = NON (anti boucle)
+ask_yes_no_once() {
   local prompt="$1" ans=""
-  while true; do
-    if ! read -rp "$prompt [y/n] : " ans; then
-      echo
-      return 1
-    fi
-    ans="$(printf "%s" "$ans" | tr '[:upper:]' '[:lower:]')"
-    case "$ans" in
-      y|yes|o|oui) return 0 ;;
-      n|no|non|"") return 1 ;;
-      *) echo "Répondre y/n" ;;
-    esac
-  done
+  if ! read -rp "$prompt [y/n] : " ans; then
+    echo
+    return 1
+  fi
+  ans="$(printf "%s" "$ans" | tr '[:upper:]' '[:lower:]')"
+  case "$ans" in
+    y|yes|o|oui) return 0 ;;
+    *) return 1 ;;
+  esac
 }
 
 rest_get_or_empty() {
@@ -64,10 +50,7 @@ rest_get_or_empty() {
   return 0
 }
 
-#######################################
-# REST PARSERS
-#######################################
-# Device-group sync-failover : retourne "DG_NAME|MEMBERS|ok"
+# --- Device-group sync-failover (cluster) ---
 get_sync_failover_group() {
   local host="$1" dg_json dg_name members
 
@@ -79,38 +62,31 @@ get_sync_failover_group() {
       | .[0].name // empty
     ' <<<"$dg_json" 2>/dev/null || true)"
   dg_name="$(trim "${dg_name:-}")"
-
   [[ -z "$dg_name" ]] && { echo "none|0|0"; return 0; }
 
-  # Attention: certains noms peuvent contenir /Common/xxx => REST attend ~Common~xxx.
-  # On convertit si besoin.
+  # encode partitioned name if needed: /Common/DG -> ~Common~DG
   local dg_uri="$dg_name"
   if [[ "$dg_uri" == /*/* ]]; then
-    # "/Common/DG" -> "~Common~DG"
     dg_uri="~${dg_uri#/}"
     dg_uri="${dg_uri//\//~}"
   fi
 
   members="$(rest_get_or_empty "$host" "/mgmt/tm/cm/device-group/${dg_uri}/devices?\$top=${TOP}" \
-      | jq -r '(.items // []) | length' 2>/dev/null || echo "0")"
-
+    | jq -r '(.items // []) | length' 2>/dev/null || echo "0")"
   members="$(trim "${members:-0}")"
   [[ "$members" =~ ^[0-9]+$ ]] || members="0"
 
   echo "${dg_name}|${members}|1"
 }
 
-# ✅ FAILOVER: chercher EXPLICITEMENT ACTIVE/STANDBY (et ignorer Color Green)
+# --- Failover ACTIVE/STANDBY (robuste) ---
 get_failover_status() {
   local host="$1" js word
   js="$(rest_get_or_empty "$host" "/mgmt/tm/cm/failover-status" || true)"
 
   word="$(jq -r '
-      [ .. | strings
-        | select(test("\\b(ACTIVE|STANDBY)\\b";"i"))
-      ][0] // empty
+      [ .. | strings | select(test("\\b(ACTIVE|STANDBY)\\b";"i")) ][0] // empty
     ' <<<"$js" 2>/dev/null || true)"
-
   word="$(trim "${word:-}")"
   word="$(printf "%s" "$word" | tr '[:upper:]' '[:lower:]')"
 
@@ -121,16 +97,30 @@ get_failover_status() {
   esac
 }
 
-# ✅ SYNC: chercher un libellé de sync (éviter les couleurs)
+# --- Sync status (✅ via /stats, pas via kind) ---
 get_sync_status() {
   local host="$1" js s
-  js="$(rest_get_or_empty "$host" "/mgmt/tm/cm/sync-status" || true)"
 
+  js="$(rest_get_or_empty "$host" "/mgmt/tm/cm/sync-status/stats" || true)"
+
+  # Cherche une description "Status ..." ou "status" dans nestedStats
   s="$(jq -r '
-      [ .. | strings
-        | select(test("In Sync|Not All|Synced|Sync|Pending|Changes|Awaiting";"i"))
-        | select(test("\\b(Green|Red|Yellow|Blue)\\b";"i") | not)
-      ][0] // empty
+      def pick:
+        (
+          .nestedStats.entries.status.description? //
+          .nestedStats.entries.Status.description? //
+          empty
+        );
+
+      (
+        .entries // {} | to_entries[]
+        | .value
+        | pick
+      ) as $d
+      | $d
+      | select(. != null and . != "")
+      | first
+      // empty
     ' <<<"$js" 2>/dev/null || true)"
 
   s="$(trim "${s:-}")"
@@ -158,9 +148,6 @@ run_config_sync() {
     -d "{\"command\":\"run\",\"utilCmdArgs\":\"config-sync to-group ${dg}\"}" >/dev/null
 }
 
-#######################################
-# MAIN
-#######################################
 TOTAL=$(grep -Ev '^\s*#|^\s*$' "$DEVICES_FILE" | wc -l | awk '{print $1}')
 COUNT=0
 
@@ -211,11 +198,10 @@ while IFS= read -r LINE || [[ -n "$LINE" ]]; do
   echo "failover     : $FAILOVER"
   echo "sync-status  : $SYNC  ($SYNC_NORM)"
 
-  # ✅ Proposition config-sync uniquement sur ACTIVE + out-of-sync
   if [[ "$MODE" == "cluster" && "$ROLE" == "ha-active" && "$SYNC_NORM" == "out-of-sync" && "$DG" != "none" ]]; then
     echo
     echo "⚠️  Device-group non synchronisé."
-    if ask_yes_no "➡️  Lancer config-sync vers '${DG}' sur ${HOST} ?"; then
+    if ask_yes_no_once "➡️  Lancer config-sync vers '${DG}' sur ${HOST} ?"; then
       echo "⏳ Envoi commande REST : config-sync to-group ${DG}"
       set +e
       run_config_sync "$HOST" "$DG"
