@@ -131,4 +131,12 @@ while IFS= read -r LINE || [[ -n "$LINE" ]]; do
   AFM_JSON="$(rest_get_or_empty "$HOST" "/mgmt/tm/security/firewall/policy?\$top=${TOP}" || true)"
   AFM_TOTAL="$(jq -r '(.items // []) | length' <<<"$AFM_JSON" 2>/dev/null || echo 0)"
 
-  echo "VS            : total=${VS_TOTAL}  up=${VS_UP}
+  echo "VS            : total=${VS_TOTAL}  up=${VS_UP}  down=${VS_DOWN}  unknown=${VS_UNK}"
+  echo "Pools         : total=${POOL_TOTAL}  up=${POOL_UP}  down=${POOL_DOWN}  unknown=${POOL_UNK}"
+  echo "Pool members  : total=${PM_TOTAL}  up=${PM_UP}  down=${PM_DOWN}  unknown=${PM_UNK}"
+  echo "ASM policies  : total=${ASM_TOTAL}"
+  echo "AFM policies  : total=${AFM_TOTAL}"
+  echo
+done < "$DEVICES_FILE"
+
+echo "🏁 Terminé"
