@@ -1,20 +1,32 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+#######################################
+# CONFIG
+#######################################
 DEVICES_FILE="devices.txt"
 TOP=10000
 CURL_OPTS=(-k -sS --connect-timeout 10 --max-time 30)
 
+#######################################
+# PRECHECKS
+#######################################
 for bin in curl jq awk tr grep wc; do
   command -v "$bin" >/dev/null || { echo "❌ $bin requis"; exit 1; }
 done
 [[ -f "$DEVICES_FILE" ]] || { echo "❌ Fichier équipements introuvable : $DEVICES_FILE"; exit 1; }
 
+#######################################
+# INPUTS
+#######################################
 read -rp "Utilisateur API (REST, ex: admin): " API_USER
 read -s -rp "Mot de passe API (REST): " API_PASS
 echo
 AUTH=(-u "${API_USER}:${API_PASS}")
 
+#######################################
+# HELPERS
+#######################################
 trim() {
   local s="$1"
   s="${s#"${s%%[![:space:]]*}"}"
@@ -95,7 +107,7 @@ TOTAL=$(grep -Ev '^\s*#|^\s*$' "$DEVICES_FILE" | wc -l | awk '{print $1}')
 COUNT=0
 
 echo
-echo "📊 Summary LTM/ASM/AFM (REST) — folders/partitions OK, moins de requêtes"
+echo "📊 Summary LTM/ASM/AFM (REST) — FINAL (moins de requêtes, partitions/folders OK)"
 echo "📌 Requêtes par équipement : 5 (VS stats, Pool stats, Members stats, ASM, AFM)"
 echo
 
@@ -108,19 +120,19 @@ while IFS= read -r LINE || [[ -n "$LINE" ]]; do
   echo "➡️  [$COUNT/$TOTAL] BIG-IP : $HOST"
   echo "======================================"
 
-  # VS stats (inclut partitions + folders)
+  # VS stats (✅ prend en compte https://localhost/... et folders/partitions)
   VS_STATS="$(rest_get_or_empty "$HOST" "/mgmt/tm/ltm/virtual/stats?\$top=${TOP}" || true)"
-  VS_COUNTS="$(jq --arg KRE "/mgmt/tm/ltm/virtual/.*/stats\$" -r "$count_from_stats_by_key_jq" <<<"$VS_STATS" 2>/dev/null || echo $'0\t0\t0\t0')"
+  VS_COUNTS="$(jq --arg KRE "/ltm/virtual/.*/stats\$" -r "$count_from_stats_by_key_jq" <<<"$VS_STATS" 2>/dev/null || echo $'0\t0\t0\t0')"
   IFS=$'\t' read -r VS_TOTAL VS_UP VS_DOWN VS_UNK <<<"$VS_COUNTS"
 
-  # Pool stats (inclut partitions + folders)
+  # Pool stats
   POOL_STATS="$(rest_get_or_empty "$HOST" "/mgmt/tm/ltm/pool/stats?\$top=${TOP}" || true)"
-  POOL_COUNTS="$(jq --arg KRE "/mgmt/tm/ltm/pool/.*/stats\$" -r "$count_from_stats_by_key_jq" <<<"$POOL_STATS" 2>/dev/null || echo $'0\t0\t0\t0')"
+  POOL_COUNTS="$(jq --arg KRE "/ltm/pool/.*/stats\$" -r "$count_from_stats_by_key_jq" <<<"$POOL_STATS" 2>/dev/null || echo $'0\t0\t0\t0')"
   IFS=$'\t' read -r POOL_TOTAL POOL_UP POOL_DOWN POOL_UNK <<<"$POOL_COUNTS"
 
-  # Pool members stats (inclut members dans folders)
+  # Pool members stats
   PM_STATS="$(rest_get_or_empty "$HOST" "/mgmt/tm/ltm/pool/members/stats?\$top=${TOP}" || true)"
-  PM_COUNTS="$(jq --arg KRE "/mgmt/tm/ltm/pool/members/.*/stats\$" -r "$count_from_stats_by_key_jq" <<<"$PM_STATS" 2>/dev/null || echo $'0\t0\t0\t0')"
+  PM_COUNTS="$(jq --arg KRE "/ltm/pool/members/.*/stats\$" -r "$count_from_stats_by_key_jq" <<<"$PM_STATS" 2>/dev/null || echo $'0\t0\t0\t0')"
   IFS=$'\t' read -r PM_TOTAL PM_UP PM_DOWN PM_UNK <<<"$PM_COUNTS"
 
   # ASM policies count
