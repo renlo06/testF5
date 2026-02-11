@@ -1,20 +1,35 @@
 #!/usr/bin/env bash
 set -uo pipefail
 
+#######################################
+# CONFIG
+#######################################
 DEVICES_FILE="devices.txt"
 CURL_BASE=(-k -sS --connect-timeout 10 --max-time 30)
 TOP=10000
 
+#######################################
+# PRECHECKS
+#######################################
 for bin in curl jq awk grep wc tr sed; do
   command -v "$bin" >/dev/null || { echo "❌ $bin requis"; exit 1; }
 done
 [[ -f "$DEVICES_FILE" ]] || { echo "❌ Fichier équipements introuvable : $DEVICES_FILE"; exit 1; }
 
+#######################################
+# INPUTS
+#######################################
 read -rp "Utilisateur API (REST, ex: admin): " API_USER
 read -s -rp "Mot de passe API (REST): " API_PASS
 echo
 AUTH=(-u "${API_USER}:${API_PASS}")
 
+# ✅ pour ne proposer la synchro qu'une seule fois par device-group
+declare -A SYNC_OFFERED
+
+#######################################
+# HELPERS
+#######################################
 trim() {
   local s="$1"
   s="${s#"${s%%[![:space:]]*}"}"
@@ -22,9 +37,10 @@ trim() {
   printf "%s" "$s"
 }
 
+# ✅ lit toujours sur le terminal (même si stdin redirigé ou menu)
 ask_yes_no_once() {
   local prompt="$1" ans=""
-  if ! read -rp "$prompt [y/n] : " ans; then
+  if ! read -rp "$prompt [y/n] : " ans < /dev/tty; then
     echo
     return 1
   fi
@@ -49,7 +65,10 @@ rest_get_or_empty() {
   return 0
 }
 
-# --- Device-group sync-failover (cluster) ---
+#######################################
+# REST PARSERS
+#######################################
+# Device-group sync-failover (cluster) => "DG_NAME|MEMBERS|ok"
 get_sync_failover_group() {
   local host="$1" dg_json dg_name members
 
@@ -63,6 +82,7 @@ get_sync_failover_group() {
   dg_name="$(trim "${dg_name:-}")"
   [[ -z "$dg_name" ]] && { echo "none|0|0"; return 0; }
 
+  # encode partitioned name if needed: /Common/DG -> ~Common~DG
   local dg_uri="$dg_name"
   if [[ "$dg_uri" == /*/* ]]; then
     dg_uri="~${dg_uri#/}"
@@ -77,7 +97,7 @@ get_sync_failover_group() {
   echo "${dg_name}|${members}|1"
 }
 
-# --- Failover ACTIVE/STANDBY (robuste) ---
+# Failover ACTIVE/STANDBY (robuste)
 get_failover_status() {
   local host="$1" js word
   js="$(rest_get_or_empty "$host" "/mgmt/tm/cm/failover-status" || true)"
@@ -96,15 +116,14 @@ get_failover_status() {
   esac
 }
 
-# ✅ SYNC STATUS selon TON JSON: on parse details.description
-# Retourne 2 choses via echo: "<status_token>|<detail_line>"
-# ex: "In Sync|Device-Group-HA (In Sync): All devices..."
+# ✅ Sync-status selon ton JSON: details.description contient "Device-Group-HA (In Sync): ..."
+# Retour: "<token>|<detail_line>"
 get_sync_status_for_dg() {
   local host="$1" dg="$2" js line st
 
   js="$(rest_get_or_empty "$host" "/mgmt/tm/cm/sync-status" || true)"
 
-  # Récupère toutes les strings details.description, puis prend celle qui contient le DG
+  # Ligne qui contient le nom exact du DG
   line="$(jq -r --arg dg "$dg" '
       [ .. | objects
         | .details? | objects
@@ -114,7 +133,7 @@ get_sync_status_for_dg() {
     ' <<<"$js" 2>/dev/null || true)"
   line="$(trim "${line:-}")"
 
-  # Si pas trouvé, fallback: prendre une ligne qui ressemble à un DG (et ignorer device_trust_group)
+  # fallback: une ligne "Device-Group" hors device_trust_group
   if [[ -z "$line" ]]; then
     line="$(jq -r '
         [ .. | objects
@@ -135,7 +154,7 @@ get_sync_status_for_dg() {
     return 0
   fi
 
-  # Extrait le token entre parenthèses : "(In Sync)" / "(Changes Pending)" etc.
+  # Token entre parenthèses: "(In Sync)" / "(Changes Pending)" etc.
   st="$(printf "%s" "$line" | sed -n 's/.*(\([^)]\+\)).*/\1/p')"
   st="$(trim "${st:-}")"
   [[ -n "$st" ]] || st="unknown"
@@ -164,6 +183,9 @@ run_config_sync() {
     -d "{\"command\":\"run\",\"utilCmdArgs\":\"config-sync to-group ${dg}\"}" >/dev/null
 }
 
+#######################################
+# MAIN
+#######################################
 TOTAL=$(grep -Ev '^\s*#|^\s*$' "$DEVICES_FILE" | wc -l | awk '{print $1}')
 COUNT=0
 
@@ -219,7 +241,15 @@ while IFS= read -r LINE || [[ -n "$LINE" ]]; do
   echo "sync-status  : $SYNC_TOKEN  ($SYNC_NORM)"
   [[ -n "$SYNC_LINE" ]] && echo "sync-detail  : $SYNC_LINE"
 
-  if [[ "$MODE" == "cluster" && "$ROLE" == "ha-active" && "$SYNC_NORM" == "out-of-sync" && "$DG" != "none" ]]; then
+  # ✅ Proposition UNIQUEMENT sur l'actif, et UNE SEULE FOIS par device-group
+  if [[ "$MODE" == "cluster" \
+     && "$ROLE" == "ha-active" \
+     && "$SYNC_NORM" == "out-of-sync" \
+     && "$DG" != "none" \
+     && -z "${SYNC_OFFERED[$DG]:-}" ]]; then
+
+    SYNC_OFFERED["$DG"]=1
+
     echo
     echo "⚠️  Device-group non synchronisé."
     if ask_yes_no_once "➡️  Lancer config-sync vers '${DG}' sur ${HOST} ?"; then
@@ -228,6 +258,7 @@ while IFS= read -r LINE || [[ -n "$LINE" ]]; do
       run_config_sync "$HOST" "$DG"
       RC=$?
       set -e
+
       if [[ $RC -ne 0 ]]; then
         echo "❌ Échec envoi config-sync (curl RC=$RC)"
       else
