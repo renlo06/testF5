@@ -1,9 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-#######################################
-# CONFIG
-#######################################
 DEVICES_FILE="devices.txt"
 TOP=10000
 CURL_OPTS=(-k -sS --connect-timeout 10 --max-time 30)
@@ -13,25 +10,16 @@ if [[ "${1:-}" == "--debug" || "${1:-}" == "-d" ]]; then
   DEBUG=1
 fi
 
-#######################################
-# PRECHECKS
-#######################################
 for bin in curl jq awk tr grep wc head; do
   command -v "$bin" >/dev/null || { echo "❌ $bin requis"; exit 1; }
 done
 [[ -f "$DEVICES_FILE" ]] || { echo "❌ Fichier équipements introuvable : $DEVICES_FILE"; exit 1; }
 
-#######################################
-# INPUTS
-#######################################
 read -rp "Utilisateur API (REST, ex: admin): " API_USER
 read -s -rp "Mot de passe API (REST): " API_PASS
 echo
 AUTH=(-u "${API_USER}:${API_PASS}")
 
-#######################################
-# HELPERS
-#######################################
 trim() {
   local s="$1"
   s="${s#"${s%%[![:space:]]*}"}"
@@ -53,13 +41,10 @@ rest_get_or_empty() {
   return 0
 }
 
-dbg() {
-  (( DEBUG == 1 )) || return 0
-  echo "🟦 [DEBUG] $*" >&2
-}
+dbg() { (( DEBUG == 1 )) && echo "🟦 [DEBUG] $*" >&2 || true; }
 
 #######################################
-# JQ HELPERS (folders/partitions OK)
+# JQ (partitions/folders OK)
 #######################################
 stats_key_to_fullpath_jq='
   tostring
@@ -71,6 +56,7 @@ stats_key_to_fullpath_jq='
   | "/" + .
 '
 
+# ton format => status.availabilityState
 pick_avail_scan_jq='
   (
     .nestedStats.entries["status.availabilityState"].description?
@@ -107,9 +93,6 @@ count_from_stats_by_key_jq='
     ] | @tsv
 '
 
-#######################################
-# DEBUG HELPERS (what matches? what is availability key?)
-#######################################
 debug_stats_payload() {
   local label="$1" kre="$2" payload="$3"
 
@@ -119,11 +102,6 @@ debug_stats_payload() {
   local entries_len
   entries_len="$(jq -r '(.entries // {}) | length' <<<"$payload" 2>/dev/null || echo 0)"
   dbg "entries length: $entries_len"
-
-  if [[ "$entries_len" == "0" ]]; then
-    dbg "Payload has no entries."
-    return 0
-  fi
 
   dbg "First 5 keys:"
   jq -r '(.entries // {}) | keys[]' <<<"$payload" 2>/dev/null | head -n 5 >&2 || true
@@ -140,7 +118,7 @@ debug_stats_payload() {
     | if $e == null then "NO_MATCH"
       else ($e.value.nestedStats.entries | keys[] | select(test("avail";"i")))
       end
-  ' <<<"$payload" 2>/dev/null | head -n 20 >&2 || true
+  ' <<<"$payload" 2>/dev/null | head -n 30 >&2 || true
 
   dbg "Example extracted availability (first match):"
   jq -r --arg re "$kre" '
@@ -181,8 +159,8 @@ TOTAL=$(grep -Ev '^\s*#|^\s*$' "$DEVICES_FILE" | wc -l | awk '{print $1}')
 COUNT=0
 
 echo
-echo "📊 Summary LTM/ASM/AFM (REST) — FINAL + DEBUG (option -d/--debug)"
-echo "📌 Requêtes par équipement : 5 (VS stats, Pool stats, Members stats, ASM, AFM)"
+echo "📊 Summary LTM/ASM/AFM (REST) — FINAL + DEBUG"
+echo "📌 Debug : $([[ $DEBUG -eq 1 ]] && echo ON || echo OFF)"
 echo
 
 while IFS= read -r LINE || [[ -n "$LINE" ]]; do
@@ -194,29 +172,26 @@ while IFS= read -r LINE || [[ -n "$LINE" ]]; do
   echo "➡️  [$COUNT/$TOTAL] BIG-IP : $HOST"
   echo "======================================"
 
-  # Regex robustes (compatible clés https://localhost/...)
-  VS_RE="/ltm/virtual/.*/stats\$"
-  POOL_RE="/ltm/pool/.*/stats\$"
-  PM_RE="/ltm/pool/members/.*/stats\$"
+  # ✅ IMPORTANT: pas de \ avant le $
+  VS_RE="/ltm/virtual/.*/stats$"
+  POOL_RE="/ltm/pool/.*/stats$"
+  PM_RE="/ltm/pool/members/.*/stats$"
 
   # VS stats
   VS_STATS="$(rest_get_or_empty "$HOST" "/mgmt/tm/ltm/virtual/stats?\$top=${TOP}" || true)"
   (( DEBUG == 1 )) && debug_stats_payload "VS" "$VS_RE" "$VS_STATS"
-
   VS_COUNTS="$(jq --arg KRE "$VS_RE" -r "$count_from_stats_by_key_jq" <<<"$VS_STATS" 2>/dev/null || echo $'0\t0\t0\t0')"
   IFS=$'\t' read -r VS_TOTAL VS_UP VS_DOWN VS_UNK <<<"$VS_COUNTS"
 
   # Pool stats
   POOL_STATS="$(rest_get_or_empty "$HOST" "/mgmt/tm/ltm/pool/stats?\$top=${TOP}" || true)"
   (( DEBUG == 1 )) && debug_stats_payload "POOLS" "$POOL_RE" "$POOL_STATS"
-
   POOL_COUNTS="$(jq --arg KRE "$POOL_RE" -r "$count_from_stats_by_key_jq" <<<"$POOL_STATS" 2>/dev/null || echo $'0\t0\t0\t0')"
   IFS=$'\t' read -r POOL_TOTAL POOL_UP POOL_DOWN POOL_UNK <<<"$POOL_COUNTS"
 
   # Pool members stats
   PM_STATS="$(rest_get_or_empty "$HOST" "/mgmt/tm/ltm/pool/members/stats?\$top=${TOP}" || true)"
   (( DEBUG == 1 )) && debug_stats_payload "POOL MEMBERS" "$PM_RE" "$PM_STATS"
-
   PM_COUNTS="$(jq --arg KRE "$PM_RE" -r "$count_from_stats_by_key_jq" <<<"$PM_STATS" 2>/dev/null || echo $'0\t0\t0\t0')"
   IFS=$'\t' read -r PM_TOTAL PM_UP PM_DOWN PM_UNK <<<"$PM_COUNTS"
 
