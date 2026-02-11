@@ -50,15 +50,10 @@ ask_yes_no() {
   done
 }
 
-rest_get() {
-  local host="$1" path="$2"
-  curl "${CURL_BASE[@]}" "${AUTH[@]}" "https://${host}${path}"
-}
-
 rest_get_or_empty() {
   local host="$1" path="$2" out rc
   set +e
-  out="$(rest_get "$host" "$path")"
+  out="$(curl "${CURL_BASE[@]}" "${AUTH[@]}" "https://${host}${path}")"
   rc=$?
   set -e
   if [[ $rc -ne 0 || -z "$(trim "${out:-}")" ]]; then
@@ -69,29 +64,11 @@ rest_get_or_empty() {
   return 0
 }
 
-# Extrait une "status description" quel que soit le nesting (très courant sur BIG-IP)
-extract_status_desc() {
-  jq -r '
-    def cand:
-      (
-        .status?.description? //
-        .status?.nestedStats?.entries?.description?.description? //
-        .entries?.status?.description? //
-        .nestedStats?.entries?.status?.description? //
-        .nestedStats?.entries?.status_availabilityState?.description? //
-        empty
-      );
-
-    # Cherche dans tout l’arbre
-    ( [ .. | objects | cand ] | map(select(. != null and . != "")) | .[0] ) // empty
-  ' 2>/dev/null
-}
-
 #######################################
 # REST PARSERS
 #######################################
+# Device-group sync-failover : retourne "DG_NAME|MEMBERS|ok"
 get_sync_failover_group() {
-  # Retour: "DG_NAME|MEMBERS|ok"
   local host="$1" dg_json dg_name members
 
   dg_json="$(rest_get_or_empty "$host" "/mgmt/tm/cm/device-group?\$select=name,type&\$top=${TOP}")" || true
@@ -105,58 +82,59 @@ get_sync_failover_group() {
 
   [[ -z "$dg_name" ]] && { echo "none|0|0"; return 0; }
 
-  members="$(rest_get_or_empty "$host" "/mgmt/tm/cm/device-group/${dg_name}/devices?\$top=${TOP}" \
+  # Attention: certains noms peuvent contenir /Common/xxx => REST attend ~Common~xxx.
+  # On convertit si besoin.
+  local dg_uri="$dg_name"
+  if [[ "$dg_uri" == /*/* ]]; then
+    # "/Common/DG" -> "~Common~DG"
+    dg_uri="~${dg_uri#/}"
+    dg_uri="${dg_uri//\//~}"
+  fi
+
+  members="$(rest_get_or_empty "$host" "/mgmt/tm/cm/device-group/${dg_uri}/devices?\$top=${TOP}" \
       | jq -r '(.items // []) | length' 2>/dev/null || echo "0")"
+
   members="$(trim "${members:-0}")"
   [[ "$members" =~ ^[0-9]+$ ]] || members="0"
 
   echo "${dg_name}|${members}|1"
 }
 
+# ✅ FAILOVER: chercher EXPLICITEMENT ACTIVE/STANDBY (et ignorer Color Green)
 get_failover_status() {
-  # Retour: active/standby/unknown
-  local host="$1" js desc
+  local host="$1" js word
+  js="$(rest_get_or_empty "$host" "/mgmt/tm/cm/failover-status" || true)"
 
-  # Ajout $select=status (souvent plus simple)
-  js="$(rest_get_or_empty "$host" "/mgmt/tm/cm/failover-status?\$select=status" || true)"
+  word="$(jq -r '
+      [ .. | strings
+        | select(test("\\b(ACTIVE|STANDBY)\\b";"i"))
+      ][0] // empty
+    ' <<<"$js" 2>/dev/null || true)"
 
-  desc="$(extract_status_desc <<<"$js" | tr -d '\r' || true)"
-  desc="$(trim "${desc:-}")"
+  word="$(trim "${word:-}")"
+  word="$(printf "%s" "$word" | tr '[:upper:]' '[:lower:]')"
 
-  # Certains environnements remontent directement "ACTIVE"/"STANDBY"
-  if [[ -z "$desc" ]]; then
-    desc="$(jq -r '.. | strings | select(test("ACTIVE|STANDBY";"i")) | first // empty' <<<"$js" 2>/dev/null || true)"
-    desc="$(trim "${desc:-}")"
-  fi
-
-  desc="$(printf "%s" "$desc" | tr '[:upper:]' '[:lower:]')"
-  case "$desc" in
+  case "$word" in
     *active*) echo "active" ;;
     *standby*) echo "standby" ;;
     *) echo "unknown" ;;
   esac
 }
 
+# ✅ SYNC: chercher un libellé de sync (éviter les couleurs)
 get_sync_status() {
-  # Retour: "In Sync" / "Not All Devices Synced" / etc / unknown
-  local host="$1" js desc
+  local host="$1" js s
+  js="$(rest_get_or_empty "$host" "/mgmt/tm/cm/sync-status" || true)"
 
-  js="$(rest_get_or_empty "$host" "/mgmt/tm/cm/sync-status?\$select=status" || true)"
-
-  desc="$(extract_status_desc <<<"$js" | tr -d '\r' || true)"
-  desc="$(trim "${desc:-}")"
-
-  # Fallback: chercher une string pertinente si description introuvable
-  if [[ -z "$desc" ]]; then
-    desc="$(jq -r '
-      .. | strings
-      | select(test("In Sync|Not All|Synced|Sync|Pending|Changes";"i"))
-      | first // empty
+  s="$(jq -r '
+      [ .. | strings
+        | select(test("In Sync|Not All|Synced|Sync|Pending|Changes|Awaiting";"i"))
+        | select(test("\\b(Green|Red|Yellow|Blue)\\b";"i") | not)
+      ][0] // empty
     ' <<<"$js" 2>/dev/null || true)"
-    desc="$(trim "${desc:-}")"
-  fi
 
-  [[ -n "$desc" ]] && echo "$desc" || echo "unknown"
+  s="$(trim "${s:-}")"
+  [[ -n "$s" ]] && echo "$s" || echo "unknown"
 }
 
 norm_sync() {
@@ -177,7 +155,7 @@ run_config_sync() {
     -H "Content-Type: application/json" \
     -X POST \
     "https://${host}/mgmt/tm/cm" \
-    -d "{\"command\":\"run\",\"utilCmdArgs\":\"config-sync to-group ${dg}\"}"
+    -d "{\"command\":\"run\",\"utilCmdArgs\":\"config-sync to-group ${dg}\"}" >/dev/null
 }
 
 #######################################
@@ -233,13 +211,14 @@ while IFS= read -r LINE || [[ -n "$LINE" ]]; do
   echo "failover     : $FAILOVER"
   echo "sync-status  : $SYNC  ($SYNC_NORM)"
 
+  # ✅ Proposition config-sync uniquement sur ACTIVE + out-of-sync
   if [[ "$MODE" == "cluster" && "$ROLE" == "ha-active" && "$SYNC_NORM" == "out-of-sync" && "$DG" != "none" ]]; then
     echo
     echo "⚠️  Device-group non synchronisé."
     if ask_yes_no "➡️  Lancer config-sync vers '${DG}' sur ${HOST} ?"; then
       echo "⏳ Envoi commande REST : config-sync to-group ${DG}"
       set +e
-      run_config_sync "$HOST" "$DG" >/dev/null
+      run_config_sync "$HOST" "$DG"
       RC=$?
       set -e
       if [[ $RC -ne 0 ]]; then
