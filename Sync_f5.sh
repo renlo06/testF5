@@ -29,7 +29,6 @@ echo
 AUTH=(-u "${API_USER}:${API_PASS}")
 
 dbg() { (( DEBUG == 1 )) && echo "🟦 [DEBUG] $*" >&2 || true; }
-
 trim_line() { printf "%s" "$1" | tr -d '\r' | awk '{$1=$1;print}'; }
 
 rest_get() {
@@ -55,22 +54,18 @@ rest_get_or_empty() {
 # ROLE / SYNC / DG (REST)
 #######################################
 get_failover_role_raw() {
-  local host="$1"
-  local js
+  local host="$1" js
   js="$(rest_get_or_empty "$host" "/mgmt/tm/cm/failover-status/stats" || true)"
-
-  # On récupère une string contenant ACTIVE/STANDBY (ex: "ACTIVE FOR /Common/traffic-group-1")
   jq -r '
     def first_string($re):
       [ .. | strings | select(test($re;"i")) ][0] // empty;
-
     ( first_string("\\bACTIVE\\b") // first_string("\\bSTANDBY\\b") ) as $s
     | if $s == "" then "UNKNOWN" else $s end
   ' <<<"$js" 2>/dev/null | head -n 1
 }
 
 normalize_role() {
-  local raw="$1"
+  local raw="${1:-}"
   if grep -qi "\bACTIVE\b" <<<"$raw"; then
     echo "ACTIVE"
   elif grep -qi "\bSTANDBY\b" <<<"$raw"; then
@@ -81,23 +76,32 @@ normalize_role() {
 }
 
 get_sync_status() {
-  local host="$1"
-  local js
+  local host="$1" js
   js="$(rest_get_or_empty "$host" "/mgmt/tm/cm/sync-status/stats" || true)"
+  # On récupère une string significative (souvent "Device-Group-... (In Sync): ...")
   jq -r '
-    def pick_sync:
+    def pick:
       [ .. | strings
         | select(test("In Sync|Changes Pending|Not All Devices Synced|Out of Sync|out-of-sync";"i"))
       ][0] // empty;
-
-    (pick_sync) as $s
+    (pick) as $s
     | if $s == "" then "UNKNOWN" else $s end
   ' <<<"$js" 2>/dev/null | head -n 1
 }
 
+# ✅ NOUVEAU: In Sync “robuste”
+is_in_sync() {
+  local s="${1:-}"
+  # On considère In Sync si on voit "In Sync" et qu'on ne voit pas de motifs out-of-sync connus
+  if grep -qi "In Sync" <<<"$s" \
+     && ! grep -qi "Not All Devices Synced|Changes Pending|Out of Sync|out-of-sync" <<<"$s"; then
+    return 0
+  fi
+  return 1
+}
+
 get_sync_failover_device_group() {
-  local host="$1"
-  local js
+  local host="$1" js
   js="$(rest_get_or_empty "$host" "/mgmt/tm/cm/device-group?\$select=name,fullPath,type" || true)"
   jq -r '
     (.items // [])
@@ -111,7 +115,6 @@ get_sync_failover_device_group() {
 #######################################
 run_config_sync_to_group() {
   local host="$1" dg="$2"
-
   local payload
   payload="$(jq -n --arg dg "$dg" \
     '{command:"run", utilCmdArgs:("-lc tmsh run cm config-sync to-group \"" + $dg + "\"") }')"
@@ -132,7 +135,7 @@ COUNT=0
 FAILS=0
 
 echo
-echo "🔁 HA Sync helper — propose la synchro UNIQUEMENT sur l'ACTIVE si sync-status ≠ In Sync"
+echo "🔁 HA Sync helper — proposition UNIQUEMENT sur l'ACTIVE si sync-status ≠ In Sync"
 echo "Debug : $([[ $DEBUG -eq 1 ]] && echo ON || echo OFF)"
 echo
 
@@ -155,28 +158,22 @@ while IFS= read -r LINE || [[ -n "$LINE" ]]; do
   echo "Sync-status : ${SYNC_STATUS:-UNKNOWN}"
   echo "Device-group: ${DG:-NONE}"
 
-  if [[ -z "${DG:-}" ]]; then
-    echo "⚠️  Aucun device-group sync-failover détecté, skip."
-    echo
-    continue
-  fi
+  [[ -n "${DG:-}" ]] || { echo "⚠️  Aucun device-group sync-failover détecté, skip."; echo; continue; }
 
-  # ✅ CORRECTION: on se base sur ROLE normalisé, pas sur égalité stricte de la chaîne raw
   if [[ "$ROLE" != "ACTIVE" ]]; then
     echo "ℹ️  Non-ACTIVE => aucune proposition de synchro."
     echo
     continue
   fi
 
-  # Proposer dès que ce n'est pas In Sync (peu importe Changes Pending / Not All Devices Synced / etc.)
-  if grep -qi '^In Sync$' <<<"${SYNC_STATUS:-}"; then
+  # ✅ CORRECTION: In Sync même dans une phrase
+  if is_in_sync "${SYNC_STATUS:-}"; then
     echo "✅ In Sync => aucune action."
     echo
     continue
   fi
 
   echo "⚠️  L'ACTIVE n'est pas In Sync."
-  # Important: lire sur /dev/tty pour ne pas consommer devices.txt
   read -r -p "➡️  Lancer 'config-sync to-group ${DG}' depuis l'ACTIVE ? (y/n) : " ans </dev/tty || ans="n"
 
   case "${ans,,}" in
@@ -191,9 +188,7 @@ while IFS= read -r LINE || [[ -n "$LINE" ]]; do
         FAILS=$((FAILS+1))
       fi
       ;;
-    *)
-      echo "⏭️  Sync non lancée."
-      ;;
+    *) echo "⏭️  Sync non lancée." ;;
   esac
 
   echo
