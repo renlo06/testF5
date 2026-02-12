@@ -52,63 +52,42 @@ rest_get_or_empty() {
 }
 
 #######################################
-# PARSERS (robustes)
+# ROLE / SYNC / DG (REST)
 #######################################
-# Extrait la valeur "Status" depuis un payload stats cm::* (ACTIVE/STANDBY) ou "In Sync" etc.
-extract_cm_status() {
-  jq -r '
-    def scan_status:
-      [ .. | objects
-        | to_entries[]
-        | select(.key|tostring|test("^status$|^Status$"))
-        | .value
-        | ( .description? // .value? // . )
-        | select(type=="string" and .!="")
-      ][0] // empty;
-
-    def scan_status_label:
-      [ .. | objects
-        | to_entries[]
-        | select(.key|tostring|test("^status$|^Status$"))
-        | .value.description?
-        | select(type=="string" and .!="")
-      ][0] // empty;
-
-    # Cas le plus fréquent: nestedStats.entries.Status.description
-    (
-      .entries? // .nestedStats? // .
-    ) as $root
-    | (
-        $root | scan_status
-      ) // empty
-  ' 2>/dev/null
-}
-
-# Récupère le rôle ACTIVE/STANDBY via failover-status
-get_failover_role() {
+get_failover_role_raw() {
   local host="$1"
   local js
   js="$(rest_get_or_empty "$host" "/mgmt/tm/cm/failover-status/stats" || true)"
-  # on cherche le premier "Status" qui ressemble à ACTIVE/STANDBY
+
+  # On récupère une string contenant ACTIVE/STANDBY (ex: "ACTIVE FOR /Common/traffic-group-1")
   jq -r '
     def first_string($re):
       [ .. | strings | select(test($re;"i")) ][0] // empty;
-    # essais: "ACTIVE"/"STANDBY" présents dans les strings
-    ( first_string("\\bACTIVE\\b") // first_string("\\bSTANDBY\\b") // first_string("\\bSTANDBY\\b") ) as $s
-    | if $s == "" then "UNKNOWN" else ($s | ascii_upcase) end
+
+    ( first_string("\\bACTIVE\\b") // first_string("\\bSTANDBY\\b") ) as $s
+    | if $s == "" then "UNKNOWN" else $s end
   ' <<<"$js" 2>/dev/null | head -n 1
 }
 
-# Récupère le sync-status (In Sync / Changes Pending / Not All Devices Synced ...)
+normalize_role() {
+  local raw="$1"
+  if grep -qi "\bACTIVE\b" <<<"$raw"; then
+    echo "ACTIVE"
+  elif grep -qi "\bSTANDBY\b" <<<"$raw"; then
+    echo "STANDBY"
+  else
+    echo "UNKNOWN"
+  fi
+}
+
 get_sync_status() {
   local host="$1"
   local js
   js="$(rest_get_or_empty "$host" "/mgmt/tm/cm/sync-status/stats" || true)"
-  # on cherche une string type "In Sync", "Changes Pending", "Not All Devices Synced"
   jq -r '
     def pick_sync:
       [ .. | strings
-        | select(test("In Sync|Changes Pending|Not All Devices Synced";"i"))
+        | select(test("In Sync|Changes Pending|Not All Devices Synced|Out of Sync|out-of-sync";"i"))
       ][0] // empty;
 
     (pick_sync) as $s
@@ -116,7 +95,6 @@ get_sync_status() {
   ' <<<"$js" 2>/dev/null | head -n 1
 }
 
-# Choisit automatiquement le 1er device-group de type sync-failover
 get_sync_failover_device_group() {
   local host="$1"
   local js
@@ -134,13 +112,11 @@ get_sync_failover_device_group() {
 run_config_sync_to_group() {
   local host="$1" dg="$2"
 
-  # tmsh: run cm config-sync to-group <dg>
-  # via REST: /mgmt/tm/util/bash
   local payload
-  payload=$(jq -n --arg dg "$dg" \
-    '{command:"run", utilCmdArgs:("-lc tmsh run cm config-sync to-group \"" + $dg + "\"") }')
+  payload="$(jq -n --arg dg "$dg" \
+    '{command:"run", utilCmdArgs:("-lc tmsh run cm config-sync to-group \"" + $dg + "\"") }')"
 
-  dbg "run config-sync on $host to-group=$dg"
+  dbg "POST /mgmt/tm/util/bash (config-sync to-group \"$dg\") on $host"
   curl "${CURL_OPTS[@]}" "${AUTH[@]}" \
     -H "Content-Type: application/json" \
     -X POST \
@@ -169,45 +145,47 @@ while IFS= read -r LINE || [[ -n "$LINE" ]]; do
   echo "➡️  [$COUNT/$TOTAL] BIG-IP : $HOST"
   echo "======================================"
 
-  ROLE="$(get_failover_role "$HOST" || true)"
+  ROLE_RAW="$(get_failover_role_raw "$HOST" || true)"
+  ROLE="$(normalize_role "${ROLE_RAW:-UNKNOWN}")"
   SYNC_STATUS="$(get_sync_status "$HOST" || true)"
   DG="$(get_sync_failover_device_group "$HOST" || true)"
 
-  echo "Role       : ${ROLE}"
-  echo "Sync-status : ${SYNC_STATUS}"
+  echo "Role        : ${ROLE_RAW:-UNKNOWN}"
+  echo "Role (norm) : ${ROLE}"
+  echo "Sync-status : ${SYNC_STATUS:-UNKNOWN}"
   echo "Device-group: ${DG:-NONE}"
 
-  # si pas de DG -> rien à faire
   if [[ -z "${DG:-}" ]]; then
     echo "⚠️  Aucun device-group sync-failover détecté, skip."
     echo
     continue
   fi
 
-  # Proposer UNIQUEMENT sur l'ACTIVE
+  # ✅ CORRECTION: on se base sur ROLE normalisé, pas sur égalité stricte de la chaîne raw
   if [[ "$ROLE" != "ACTIVE" ]]; then
     echo "ℹ️  Non-ACTIVE => aucune proposition de synchro."
     echo
     continue
   fi
 
-  # Proposer dès que ce n'est pas In Sync (quel que soit le message)
-  if grep -qi '^In Sync$' <<<"$SYNC_STATUS"; then
+  # Proposer dès que ce n'est pas In Sync (peu importe Changes Pending / Not All Devices Synced / etc.)
+  if grep -qi '^In Sync$' <<<"${SYNC_STATUS:-}"; then
     echo "✅ In Sync => aucune action."
     echo
     continue
   fi
 
   echo "⚠️  L'ACTIVE n'est pas In Sync."
-  # prompt sur /dev/tty (sinon boucle/lecture du fichier)
+  # Important: lire sur /dev/tty pour ne pas consommer devices.txt
   read -r -p "➡️  Lancer 'config-sync to-group ${DG}' depuis l'ACTIVE ? (y/n) : " ans </dev/tty || ans="n"
+
   case "${ans,,}" in
     y|yes)
       if run_config_sync_to_group "$HOST" "$DG"; then
         echo "🚀 Sync lancé."
         sleep 2
         NEW_SYNC="$(get_sync_status "$HOST" || true)"
-        echo "Sync-status après : ${NEW_SYNC}"
+        echo "Sync-status après : ${NEW_SYNC:-UNKNOWN}"
       else
         echo "❌ Échec lancement sync."
         FAILS=$((FAILS+1))
