@@ -7,8 +7,9 @@ set -euo pipefail
 DEVICES_FILE="devices.txt"
 
 CURL_OPTS=(-k -sS --connect-timeout 10 --max-time 30)
+
 SYNC_POLL_SLEEP=3
-SYNC_POLL_TIMEOUT=300
+SYNC_POLL_TIMEOUT=300  # 5 min
 
 DEBUG=0
 if [[ "${1:-}" == "--debug" || "${1:-}" == "-d" ]]; then
@@ -49,7 +50,7 @@ rest_get_or_empty() {
 }
 
 #######################################
-# HA ROLE
+# ROLE ACTIVE/STANDBY (robuste)
 #######################################
 get_failover_role_raw() {
   local host="$1" js
@@ -74,56 +75,60 @@ normalize_role() {
 }
 
 #######################################
-# DEVICE-GROUP sync-failover
-#######################################
-get_sync_failover_device_group() {
-  local host="$1" js
-  js="$(rest_get_or_empty "$host" "/mgmt/tm/cm/device-group?\$select=fullPath,type" || true)"
-  jq -r '
-    (.items // [])
-    | map(select((.type // "") | test("sync-failover";"i")))
-    | .[0].fullPath // empty
-  ' <<<"$js" 2>/dev/null | head -n 1
-}
-
-#######################################
-# SYNC STATUS + COLOR
+# SYNC STATUS extraction per device-group
+# On parse les strings du type:
+# "Device-Group-HA (In Sync): ..."
+# "DG1 (Changes Pending): ..."
+# "DG2 (Not All Devices Synced): ..."
+# "DG3 (Awaiting Initial Sync): ..."
 #######################################
 get_sync_stats_json() {
   local host="$1"
   rest_get_or_empty "$host" "/mgmt/tm/cm/sync-status/stats" || echo "{}"
 }
 
-get_sync_status_text() {
+# Sortie: TSV "dg<TAB>status" (peut contenir doublons)
+extract_dg_status_tsv() {
   local js="$1"
   jq -r '
+    def allowed:
+      "In Sync|Awaiting Initial Sync|Changes Pending|Not All Devices Synced";
+
+    # récupère toutes les strings pertinentes, puis capture groupe + status
     [ .. | strings
-      | select(test("Changes Pending|In Sync|Not All Devices Synced|Out of Sync|out-of-sync";"i"))
-    ][0] // "UNKNOWN"
-  ' <<<"$js" 2>/dev/null | head -n 1
+      | select(test("\\((" + allowed + ")\\)"; "i"))
+    ]
+    | map(
+        capture("^(?<dg>[^\\(]+)\\s*\\((?<st>" + allowed + ")\\)")?
+        | select(. != null)
+        | {dg: (.dg|gsub("\\s+$";"")|gsub("^\\s+";"")), st: .st}
+      )
+    | .[]
+    | [.dg, .st] | @tsv
+  ' <<<"$js" 2>/dev/null || true
 }
 
-get_sync_color_desc() {
-  local js="$1"
-  jq -r '
-    [ .. | objects | .color? | .description? ] | map(select(. != null)) | .[0] // "unknown"
-  ' <<<"$js" 2>/dev/null | head -n 1
-}
-
-is_in_sync_text() {
-  local s="${1:-}"
-  if grep -qi "In Sync" <<<"$s" \
-     && ! grep -qi "Changes Pending|Not All Devices Synced|Out of Sync|out-of-sync" <<<"$s"; then
-    return 0
-  fi
-  return 1
+# Priorité (plus grand = plus critique)
+# In Sync = 0
+# Awaiting Initial Sync = 1
+# Not All Devices Synced = 2
+# Changes Pending = 3
+status_prio() {
+  case "$1" in
+    "In Sync") echo 0 ;;
+    "Awaiting Initial Sync") echo 1 ;;
+    "Not All Devices Synced") echo 2 ;;
+    "Changes Pending") echo 3 ;;
+    *) echo 0 ;;
+  esac
 }
 
 #######################################
-# ACTIONS (REST 100%)
+# ACTION: Config-Sync (REST 100%)
 #######################################
-run_cm_config_sync() {
+run_config_sync_to_group() {
   local host="$1" dg="$2"
+  # dg peut être "Device-Group-HA" ou "/Common/Device-Group-HA"
   curl "${CURL_OPTS[@]}" "${AUTH[@]}" \
     -H "Content-Type: application/json" \
     -X POST \
@@ -131,75 +136,33 @@ run_cm_config_sync() {
     "https://${host}/mgmt/tm/cm" >/dev/null
 }
 
-run_cm_force_full_load_push() {
+# Re-poll jusqu'à In Sync pour ce device-group (quand le texte inclut dg + In Sync)
+poll_dg_until_in_sync() {
   local host="$1" dg="$2"
-  curl "${CURL_OPTS[@]}" "${AUTH[@]}" \
-    -H "Content-Type: application/json" \
-    -X POST \
-    -d "{\"command\":\"run\",\"utilCmdArgs\":\"config-sync force-full-load-push to-group ${dg}\"}" \
-    "https://${host}/mgmt/tm/cm" >/dev/null
-}
-
-poll_until_in_sync() {
-  local host="$1"
-  local start now js status color
+  local start now js
 
   start="$(date +%s)"
   while true; do
     js="$(get_sync_stats_json "$host")"
-    status="$(get_sync_status_text "$js")"
-    color="$(get_sync_color_desc "$js" | tr '[:upper:]' '[:lower:]')"
 
-    dbg "poll status=$status color=$color"
-
-    if is_in_sync_text "$status"; then
-      echo "✅ In Sync confirmé (color=$color) : $status"
+    # Cherche une string "dg (In Sync)"
+    if jq -e --arg dg "$dg" '
+      [ .. | strings
+        | select(test("^" + ($dg|gsub("\\\\";"\\\\\\\\")) + "\\s*\\(In Sync\\)"; "i"))
+      ] | length > 0
+    ' <<<"$js" >/dev/null 2>&1; then
+      echo "✅ $dg : In Sync confirmé"
       return 0
     fi
 
     now="$(date +%s)"
     if (( now - start >= SYNC_POLL_TIMEOUT )); then
-      echo "⏱️  Timeout (${SYNC_POLL_TIMEOUT}s) — dernier : status=$status color=$color"
+      echo "⏱️  Timeout (${SYNC_POLL_TIMEOUT}s) — $dg toujours pas In Sync"
       return 1
     fi
 
     sleep "$SYNC_POLL_SLEEP"
   done
-}
-
-#######################################
-# DECISION ENGINE (3 règles)
-#######################################
-choose_sync_action() {
-  # echo "FORCE" | "NORMAL" | "NONE"
-  local status="$1" color="$2"
-
-  # Règle 1 & 2: Changes Pending
-  if grep -qi "Changes Pending" <<<"$status"; then
-    if [[ "$color" == "red" ]]; then
-      echo "FORCE"
-    elif [[ "$color" == "yellow" ]]; then
-      echo "NORMAL"
-    else
-      echo "NONE"
-    fi
-    return 0
-  fi
-
-  # ✅ Règle 3: Not All Devices Synced
-  if grep -qi "Not All Devices Synced" <<<"$status"; then
-    if [[ "$color" == "red" ]]; then
-      echo "FORCE"
-    elif [[ "$color" == "yellow" ]]; then
-      echo "NORMAL"
-    else
-      # par défaut, on propose au moins un config-sync standard
-      echo "NORMAL"
-    fi
-    return 0
-  fi
-
-  echo "NONE"
 }
 
 #######################################
@@ -210,11 +173,13 @@ COUNT=0
 FAILS=0
 
 echo
-echo "🔁 HA Sync (règles Status+Color) — proposition uniquement sur l'ACTIVE"
-echo "Règles :"
-echo "  1) Changes Pending + red    => force-full-load-push"
-echo "  2) Changes Pending + yellow => config-sync standard"
-echo "  3) Not All Devices Synced   => (red=>force, yellow=>standard, other=>standard)"
+echo "🔁 HA ConfigSync — multi device-groups (REST)"
+echo "Statuts pris en compte :"
+echo "  - In Sync"
+echo "  - Awaiting Initial Sync"
+echo "  - Changes Pending"
+echo "  - Not All Devices Synced"
+echo "Règle : synchronisation proposée/exécutée uniquement depuis l'ACTIVE"
 echo
 
 while IFS= read -r LINE || [[ -n "$LINE" ]]; do
@@ -228,80 +193,116 @@ while IFS= read -r LINE || [[ -n "$LINE" ]]; do
 
   ROLE_RAW="$(get_failover_role_raw "$HOST" || true)"
   ROLE="$(normalize_role "$ROLE_RAW")"
-  DG="$(get_sync_failover_device_group "$HOST" || true)"
+  echo "Role : ${ROLE_RAW:-UNKNOWN}"
 
-  if [[ -z "${DG:-}" ]]; then
-    echo "Role        : ${ROLE_RAW:-UNKNOWN}"
-    echo "Device-group: NONE"
-    echo "⚠️  Aucun device-group sync-failover => skip."
-    echo
-    continue
+  if [[ "$ROLE" != "ACTIVE" ]]; then
+    echo "ℹ️  Non-ACTIVE => aucune action (lecture seule)."
   fi
 
   JS="$(get_sync_stats_json "$HOST")"
-  SYNC_STATUS="$(get_sync_status_text "$JS")"
-  SYNC_COLOR="$(get_sync_color_desc "$JS" | tr '[:upper:]' '[:lower:]')"
+  DG_TSV="$(extract_dg_status_tsv "$JS")"
 
-  echo "Role        : ${ROLE_RAW:-UNKNOWN}"
-  echo "Role (norm) : ${ROLE}"
-  echo "Device-group: ${DG}"
-  echo "Sync-status : ${SYNC_STATUS}"
-  echo "Color       : ${SYNC_COLOR}"
+  if [[ -z "${DG_TSV:-}" ]]; then
+    echo "⚠️  Aucun device-group détecté dans sync-status/stats (ou format non reconnu)."
+    echo
+    continue
+  fi
+
+  # Consolidation: garder le pire statut par DG
+  declare -A DG_STATUS=()
+  declare -A DG_PRIO=()
+
+  while IFS=$'\t' read -r dg st; do
+    [[ -z "${dg:-}" || -z "${st:-}" ]] && continue
+    p="$(status_prio "$st")"
+    if [[ -z "${DG_STATUS[$dg]+x}" ]]; then
+      DG_STATUS["$dg"]="$st"
+      DG_PRIO["$dg"]="$p"
+    else
+      if (( p > DG_PRIO["$dg"] )); then
+        DG_STATUS["$dg"]="$st"
+        DG_PRIO["$dg"]="$p"
+      fi
+    fi
+  done <<< "$DG_TSV"
+
+  echo
+  echo "Device-groups (détectés):"
+  for dg in "${!DG_STATUS[@]}"; do
+    printf "  - %-40s : %s\n" "$dg" "${DG_STATUS[$dg]}"
+  done
+
+  # Liste des DG nécessitant action
+  NEEDS=()
+  for dg in "${!DG_STATUS[@]}"; do
+    st="${DG_STATUS[$dg]}"
+    if [[ "$st" != "In Sync" ]]; then
+      NEEDS+=("$dg")
+    fi
+  done
+
+  if [[ "${#NEEDS[@]}" -eq 0 ]]; then
+    echo
+    echo "✅ Tous les device-groups sont In Sync."
+    echo
+    continue
+  fi
+
+  echo
+  echo "⚠️  Device-groups nécessitant une action : ${#NEEDS[@]}"
+  for dg in "${NEEDS[@]}"; do
+    echo "  * $dg : ${DG_STATUS[$dg]}"
+  done
   echo
 
+  # Action uniquement sur ACTIVE
   if [[ "$ROLE" != "ACTIVE" ]]; then
-    echo "ℹ️  Non-ACTIVE => aucune proposition."
+    echo "ℹ️  Non-ACTIVE => aucune synchronisation lancée."
     echo
     continue
   fi
 
-  if is_in_sync_text "$SYNC_STATUS"; then
-    echo "✅ Déjà In Sync => aucune action."
-    echo
-    continue
-  fi
+  # Proposer synchro DG par DG
+  for dg in "${NEEDS[@]}"; do
+    st="${DG_STATUS[$dg]}"
 
-  ACTION="$(choose_sync_action "$SYNC_STATUS" "$SYNC_COLOR")"
+    echo "--------------------------------------"
+    echo "DG : $dg"
+    echo "Status : $st"
 
-  case "$ACTION" in
-    FORCE)
-      echo "⚠️  Proposition : force-full-load-push (status=$SYNC_STATUS, color=$SYNC_COLOR)"
-      read -r -p "Lancer 'force-full-load-push to-group ${DG}' ? (y/n) : " ans </dev/tty || ans="n"
-      if [[ "${ans,,}" == "y" ]]; then
-        echo "🚀 Lancement force-full-load-push..."
-        if ! run_cm_force_full_load_push "$HOST" "$DG"; then
-          echo "❌ Échec lancement (API)."
-          FAILS=$((FAILS+1))
-          echo
-          continue
-        fi
-        echo "⏳ Attente In Sync..."
-        poll_until_in_sync "$HOST" || FAILS=$((FAILS+1))
-      else
-        echo "⏭️  Action ignorée."
-      fi
-      ;;
-    NORMAL)
-      echo "⚠️  Proposition : config-sync standard (status=$SYNC_STATUS, color=$SYNC_COLOR)"
-      read -r -p "Lancer 'config-sync to-group ${DG}' ? (y/n) : " ans </dev/tty || ans="n"
-      if [[ "${ans,,}" == "y" ]]; then
-        echo "🚀 Lancement config-sync..."
-        if ! run_cm_config_sync "$HOST" "$DG"; then
-          echo "❌ Échec lancement (API)."
-          FAILS=$((FAILS+1))
-          echo
-          continue
-        fi
-        echo "⏳ Attente In Sync..."
-        poll_until_in_sync "$HOST" || FAILS=$((FAILS+1))
-      else
-        echo "⏭️  Action ignorée."
-      fi
-      ;;
-    NONE)
-      echo "ℹ️  Aucun déclenchement selon les règles."
-      ;;
-  esac
+    case "$st" in
+      "Awaiting Initial Sync")
+        echo "➡️  Action recommandée : config-sync to-group (initial sync)"
+        ;;
+      "Changes Pending")
+        echo "➡️  Action recommandée : config-sync to-group (attention conflit possible)"
+        ;;
+      "Not All Devices Synced")
+        echo "➡️  Action recommandée : config-sync to-group (retry)"
+        ;;
+      *)
+        echo "➡️  Action : config-sync to-group"
+        ;;
+    esac
+
+    read -r -p "Lancer la synchronisation pour '$dg' ? (y/n) : " ans </dev/tty || ans="n"
+    if [[ "${ans,,}" != "y" && "${ans,,}" != "yes" ]]; then
+      echo "⏭️  Ignoré."
+      continue
+    fi
+
+    echo "🚀 Lancement : config-sync to-group $dg"
+    if ! run_config_sync_to_group "$HOST" "$dg"; then
+      echo "❌ Échec lancement via API."
+      FAILS=$((FAILS+1))
+      continue
+    fi
+
+    echo "⏳ Attente du retour In Sync pour $dg..."
+    if ! poll_dg_until_in_sync "$HOST" "$dg"; then
+      FAILS=$((FAILS+1))
+    fi
+  done
 
   echo
 done < "$DEVICES_FILE"
@@ -309,6 +310,6 @@ done < "$DEVICES_FILE"
 echo "======================================"
 echo "🏁 Terminé"
 echo "Équipements traités : $COUNT"
-echo "Erreurs            : $FAILS"
+echo "Erreurs / Timeouts  : $FAILS"
 echo "======================================"
 (( FAILS == 0 )) || exit 1
