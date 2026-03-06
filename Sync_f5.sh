@@ -161,7 +161,6 @@ get_sync_stats_json() {
   echo "$js"
 }
 
-# Sortie TSV: dg<TAB>status
 extract_dg_status_tsv() {
   local js="$1"
   jq -r '
@@ -194,9 +193,6 @@ status_prio() {
 #######################################
 # NORMALISATION DG
 #######################################
-# Convertit:
-#   /Common/Device-Group-HA -> Device-Group-HA
-#   Device-Group-HA         -> Device-Group-HA
 normalize_dg_name() {
   local dg="${1:-}"
   dg="${dg##*/}"
@@ -284,7 +280,6 @@ while IFS= read -r LINE || [[ -n "$LINE" ]]; do
   log "Role brut : ${ROLE_RAW:-UNKNOWN}"
   log "Role norm : ${ROLE}"
 
-  # 1) Liste officielle des DG sync-failover
   DG_LIST="$(get_sync_failover_device_groups "$HOST" || true)"
   if [[ -z "${DG_LIST:-}" ]]; then
     log "⚠️  Aucun device-group sync-failover trouvé."
@@ -300,7 +295,6 @@ while IFS= read -r LINE || [[ -n "$LINE" ]]; do
     dbg "DG sync-failover valide: short=$dg_short full=$dg_full"
   done <<< "$DG_LIST"
 
-  # 2) Parse des statuts depuis sync-status/stats
   JS="$(get_sync_stats_json "$HOST")"
   DG_TSV="$(extract_dg_status_tsv "$JS")"
 
@@ -310,7 +304,6 @@ while IFS= read -r LINE || [[ -n "$LINE" ]]; do
     continue
   fi
 
-  # 3) Conserver uniquement les DG qui existent vraiment en sync-failover
   declare -A DG_STATUS=()
   declare -A DG_PRIO=()
 
@@ -319,7 +312,6 @@ while IFS= read -r LINE || [[ -n "$LINE" ]]; do
 
     dg_short="$(normalize_dg_name "$dg_raw")"
 
-    # Ignore tout ce qui n'est pas un DG sync-failover officiel
     if [[ -z "${VALID_DG[$dg_short]+x}" ]]; then
       dbg "DG ignoré (non sync-failover): raw='$dg_raw' short='$dg_short' status='$st'"
       continue
@@ -386,7 +378,21 @@ while IFS= read -r LINE || [[ -n "$LINE" ]]; do
     log "--------------------------------------"
     log "DG     : $dg"
     log "Status : $st"
-    log "➡️  Recommandation : config-sync to-group"
+
+    case "$st" in
+      "Awaiting Initial Sync")
+        log "➡️  Règle appliquée : initial sync => config-sync to-group"
+        ;;
+      "Changes Pending")
+        log "➡️  Règle appliquée : changes pending => config-sync to-group"
+        ;;
+      "Not All Devices Synced")
+        log "➡️  Règle appliquée : retry sync => config-sync to-group"
+        ;;
+      *)
+        log "➡️  Règle appliquée : config-sync to-group"
+        ;;
+    esac
 
     read -r -p "Lancer la synchronisation pour '$dg' ? (y/n) : " ans </dev/tty || ans="n"
     if [[ "${ans,,}" != "y" && "${ans,,}" != "yes" ]]; then
