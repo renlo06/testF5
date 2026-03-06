@@ -73,10 +73,10 @@ rest_get_or_empty() {
   out="$(curl "${CURL_OPTS[@]}" "${AUTH[@]}" "https://${host}${path}")"
   rc=$?
   set -e
+
   dbg "GET rc=$rc path=$path"
 
   if [[ $rc -ne 0 || -z "${out:-}" ]]; then
-    dbg "GET failed or empty for $path"
     echo "{}"
     return 1
   fi
@@ -86,8 +86,7 @@ rest_get_or_empty() {
 }
 
 rest_post_cm_command() {
-  local host="$1" cmd="$2"
-  local payload out rc
+  local host="$1" cmd="$2" payload out rc
 
   payload="$(jq -n --arg c "$cmd" '{command:"run", utilCmdArgs:$c}')"
 
@@ -106,16 +105,11 @@ rest_post_cm_command() {
   dbg "POST rc=$rc"
   dump_json "POST /mgmt/tm/cm response (${host})" "$out"
 
-  if [[ $rc -ne 0 ]]; then
-    return 1
-  fi
-
-  echo "$out"
-  return 0
+  [[ $rc -eq 0 ]]
 }
 
 #######################################
-# HA ROLE
+# ROLE HA
 #######################################
 get_failover_role_raw() {
   local host="$1" js
@@ -142,6 +136,21 @@ normalize_role() {
 }
 
 #######################################
+# DEVICE-GROUPS sync-failover uniquement
+#######################################
+get_sync_failover_device_groups() {
+  local host="$1" js
+  js="$(rest_get_or_empty "$host" "/mgmt/tm/cm/device-group?\$select=fullPath,type" || true)"
+  dump_json "device-group (${host})" "$js"
+
+  jq -r '
+    (.items // [])
+    | map(select((.type // "") == "sync-failover"))
+    | .[].fullPath
+  ' <<<"$js" 2>/dev/null || true
+}
+
+#######################################
 # SYNC STATUS
 #######################################
 get_sync_stats_json() {
@@ -152,6 +161,7 @@ get_sync_stats_json() {
   echo "$js"
 }
 
+# Sortie TSV: dg<TAB>status
 extract_dg_status_tsv() {
   local js="$1"
   jq -r '
@@ -164,7 +174,7 @@ extract_dg_status_tsv() {
     | map(
         capture("^(?<dg>[^\\(]+)\\s*\\((?<st>" + allowed + ")\\)")?
         | select(. != null)
-        | {dg: (.dg|gsub("\\s+$";"")|gsub("^\\s+";"")), st: .st}
+        | {dg: (.dg|gsub("^\\s+";"")|gsub("\\s+$";"")), st: .st}
       )
     | .[]
     | [.dg, .st] | @tsv
@@ -182,18 +192,15 @@ status_prio() {
 }
 
 #######################################
-# DEVICE-GROUPS
+# NORMALISATION DG
 #######################################
-get_sync_failover_device_groups() {
-  local host="$1" js
-  js="$(rest_get_or_empty "$host" "/mgmt/tm/cm/device-group?\$select=fullPath,type" || true)"
-  dump_json "device-group (${host})" "$js"
-
-  jq -r '
-    (.items // [])
-    | map(select((.type // "") | test("sync-failover";"i")))
-    | .[].fullPath
-  ' <<<"$js" 2>/dev/null || true
+# Convertit:
+#   /Common/Device-Group-HA -> Device-Group-HA
+#   Device-Group-HA         -> Device-Group-HA
+normalize_dg_name() {
+  local dg="${1:-}"
+  dg="${dg##*/}"
+  printf "%s" "$dg"
 }
 
 #######################################
@@ -215,27 +222,27 @@ run_config_sync_to_group() {
 }
 
 poll_dg_until_in_sync() {
-  local host="$1" dg="$2"
-  local start now js
+  local host="$1" dg_full="$2"
+  local dg_short start now js
 
+  dg_short="$(normalize_dg_name "$dg_full")"
   start="$(date +%s)"
+
   while true; do
     js="$(get_sync_stats_json "$host")"
 
-    dbg "Polling DG=$dg"
-
-    if jq -e --arg dg "$dg" '
+    if jq -e --arg dg "$dg_short" '
       [ .. | strings
         | select(test("^" + ($dg|gsub("\\\\";"\\\\\\\\")) + "\\s*\\(In Sync\\)"; "i"))
       ] | length > 0
     ' <<<"$js" >/dev/null 2>&1; then
-      log "✅ $dg : In Sync confirmé"
+      log "✅ $dg_full : In Sync confirmé"
       return 0
     fi
 
     now="$(date +%s)"
     if (( now - start >= SYNC_POLL_TIMEOUT )); then
-      log "⏱️  Timeout (${SYNC_POLL_TIMEOUT}s) — $dg toujours pas In Sync"
+      log "⏱️  Timeout (${SYNC_POLL_TIMEOUT}s) — $dg_full toujours pas In Sync"
       return 1
     fi
 
@@ -251,7 +258,7 @@ COUNT=0
 FAILS=0
 
 log ""
-log "🔁 HA ConfigSync — multi device-groups (REST + DEBUG avancé)"
+log "🔁 HA ConfigSync — sync-failover uniquement"
 log "Statuts pris en compte :"
 log "  - In Sync"
 log "  - Awaiting Initial Sync"
@@ -277,6 +284,7 @@ while IFS= read -r LINE || [[ -n "$LINE" ]]; do
   log "Role brut : ${ROLE_RAW:-UNKNOWN}"
   log "Role norm : ${ROLE}"
 
+  # 1) Liste officielle des DG sync-failover
   DG_LIST="$(get_sync_failover_device_groups "$HOST" || true)"
   if [[ -z "${DG_LIST:-}" ]]; then
     log "⚠️  Aucun device-group sync-failover trouvé."
@@ -284,11 +292,15 @@ while IFS= read -r LINE || [[ -n "$LINE" ]]; do
     continue
   fi
 
-  dbg "Device-groups sync-failover détectés:"
-  while IFS= read -r dg; do
-    [[ -n "${dg:-}" ]] && dbg "  - $dg"
+  declare -A VALID_DG=()
+  while IFS= read -r dg_full; do
+    [[ -z "${dg_full:-}" ]] && continue
+    dg_short="$(normalize_dg_name "$dg_full")"
+    VALID_DG["$dg_short"]="$dg_full"
+    dbg "DG sync-failover valide: short=$dg_short full=$dg_full"
   done <<< "$DG_LIST"
 
+  # 2) Parse des statuts depuis sync-status/stats
   JS="$(get_sync_stats_json "$HOST")"
   DG_TSV="$(extract_dg_status_tsv "$JS")"
 
@@ -298,26 +310,44 @@ while IFS= read -r LINE || [[ -n "$LINE" ]]; do
     continue
   fi
 
+  # 3) Conserver uniquement les DG qui existent vraiment en sync-failover
   declare -A DG_STATUS=()
   declare -A DG_PRIO=()
 
-  while IFS=$'\t' read -r dg st; do
-    [[ -z "${dg:-}" || -z "${st:-}" ]] && continue
-    dbg "Parsed DG='$dg' status='$st'"
+  while IFS=$'\t' read -r dg_raw st; do
+    [[ -z "${dg_raw:-}" || -z "${st:-}" ]] && continue
+
+    dg_short="$(normalize_dg_name "$dg_raw")"
+
+    # Ignore tout ce qui n'est pas un DG sync-failover officiel
+    if [[ -z "${VALID_DG[$dg_short]+x}" ]]; then
+      dbg "DG ignoré (non sync-failover): raw='$dg_raw' short='$dg_short' status='$st'"
+      continue
+    fi
+
+    dg_full="${VALID_DG[$dg_short]}"
+    dbg "DG retenu: raw='$dg_raw' short='$dg_short' full='$dg_full' status='$st'"
+
     p="$(status_prio "$st")"
-    if [[ -z "${DG_STATUS[$dg]+x}" ]]; then
-      DG_STATUS["$dg"]="$st"
-      DG_PRIO["$dg"]="$p"
+    if [[ -z "${DG_STATUS[$dg_full]+x}" ]]; then
+      DG_STATUS["$dg_full"]="$st"
+      DG_PRIO["$dg_full"]="$p"
     else
-      if (( p > DG_PRIO["$dg"] )); then
-        DG_STATUS["$dg"]="$st"
-        DG_PRIO["$dg"]="$p"
+      if (( p > DG_PRIO["$dg_full"] )); then
+        DG_STATUS["$dg_full"]="$st"
+        DG_PRIO["$dg_full"]="$p"
       fi
     fi
   done <<< "$DG_TSV"
 
+  if [[ "${#DG_STATUS[@]}" -eq 0 ]]; then
+    log "⚠️  Aucun status exploitable pour les device-groups sync-failover."
+    log ""
+    continue
+  fi
+
   log ""
-  log "Device-groups détectés :"
+  log "Device-groups sync-failover détectés :"
   for dg in "${!DG_STATUS[@]}"; do
     printf "  - %-40s : %s\n" "$dg" "${DG_STATUS[$dg]}" | tee -a "$LOG_FILE"
   done
@@ -332,7 +362,7 @@ while IFS= read -r LINE || [[ -n "$LINE" ]]; do
 
   if [[ "${#NEEDS[@]}" -eq 0 ]]; then
     log ""
-    log "✅ Tous les device-groups sont In Sync."
+    log "✅ Tous les device-groups sync-failover sont In Sync."
     log ""
     continue
   fi
@@ -356,21 +386,7 @@ while IFS= read -r LINE || [[ -n "$LINE" ]]; do
     log "--------------------------------------"
     log "DG     : $dg"
     log "Status : $st"
-
-    case "$st" in
-      "Awaiting Initial Sync")
-        log "➡️  Recommandation : config-sync to-group (initial sync)"
-        ;;
-      "Changes Pending")
-        log "➡️  Recommandation : config-sync to-group"
-        ;;
-      "Not All Devices Synced")
-        log "➡️  Recommandation : config-sync to-group"
-        ;;
-      *)
-        log "➡️  Recommandation : config-sync to-group"
-        ;;
-    esac
+    log "➡️  Recommandation : config-sync to-group"
 
     read -r -p "Lancer la synchronisation pour '$dg' ? (y/n) : " ans </dev/tty || ans="n"
     if [[ "${ans,,}" != "y" && "${ans,,}" != "yes" ]]; then
