@@ -116,8 +116,7 @@ normalize_role() {
   fi
 }
 
-# Liste tous les device-groups avec type
-# sortie TSV: fullPath<TAB>type
+# fullPath<TAB>type
 get_all_device_groups_tsv() {
   local host="$1" js
   js="$(rest_get_or_empty "$host" "/mgmt/tm/cm/device-group?\$select=fullPath,type" || true)"
@@ -136,11 +135,7 @@ get_sync_stats_json() {
   echo "$js"
 }
 
-# Parse:
-# Device-Group-HA (In Sync): ...
-# device_trust_group (Changes Pending): ...
-# datasync-global-dg (Not All Devices Synced): ...
-# sortie TSV: dg_short<TAB>status
+# dg_short<TAB>status
 extract_dg_status_tsv() {
   local js="$1"
   jq -r '
@@ -220,6 +215,27 @@ poll_dg_until_in_sync() {
   done
 }
 
+# prompt adapté au statut
+build_status_prompt() {
+  local dg="$1"
+  local st="$2"
+
+  case "$st" in
+    "Awaiting Initial Sync")
+      printf "Initial sync requis pour '%s'. Lancer la synchronisation ? (y/n) : " "$dg"
+      ;;
+    "Changes Pending")
+      printf "Des changements sont en attente pour '%s'. Lancer la synchronisation ? (y/n) : " "$dg"
+      ;;
+    "Not All Devices Synced")
+      printf "La dernière synchro n'a pas atteint tous les membres pour '%s'. Relancer la synchronisation ? (y/n) : " "$dg"
+      ;;
+    *)
+      printf "Lancer la synchronisation pour '%s' ? (y/n) : " "$dg"
+      ;;
+  esac
+}
+
 TOTAL=$(grep -Ev '^\s*#|^\s*$' "$DEVICES_FILE" | wc -l | awk '{print $1}')
 COUNT=0
 FAILS=0
@@ -231,7 +247,7 @@ log "  - In Sync"
 log "  - Awaiting Initial Sync"
 log "  - Changes Pending"
 log "  - Not All Devices Synced"
-log "Règle : synchro lancée uniquement depuis l'ACTIVE et uniquement pour les sync-failover"
+log "Règle : prompt selon statut, synchro lancée uniquement depuis l'ACTIVE et uniquement pour les sync-failover"
 log "Debug : $([[ $DEBUG -eq 1 ]] && echo ON || echo OFF)"
 log "Log   : $LOG_FILE"
 log ""
@@ -258,7 +274,6 @@ while IFS= read -r LINE || [[ -n "$LINE" ]]; do
     continue
   fi
 
-  # map short -> full/type
   declare -A DG_FULL=()
   declare -A DG_TYPE=()
 
@@ -280,7 +295,6 @@ while IFS= read -r LINE || [[ -n "$LINE" ]]; do
     [[ -z "${dg_raw:-}" || -z "${st:-}" ]] && continue
     dg_short="$(normalize_dg_name "$dg_raw")"
 
-    # garder seulement les DG existants côté conf
     if [[ -z "${DG_FULL[$dg_short]+x}" ]]; then
       dbg "DG ignoré (absent de cm device-group): raw='$dg_raw' short='$dg_short' status='$st'"
       continue
@@ -307,7 +321,6 @@ while IFS= read -r LINE || [[ -n "$LINE" ]]; do
     printf "  - %-35s : %-24s (%s)\n" "$dg_full" "$dg_status" "$dg_type" | tee -a "$LOG_FILE"
   done
 
-  # synchro à proposer seulement pour sync-failover et non In Sync
   NEEDS=()
   for dg_short in "${!DG_FULL[@]}"; do
     if [[ "${DG_TYPE[$dg_short]}" == "sync-failover" ]]; then
@@ -349,20 +362,22 @@ while IFS= read -r LINE || [[ -n "$LINE" ]]; do
 
     case "$st" in
       "Awaiting Initial Sync")
-        log "➡️  Règle appliquée : initial sync => config-sync to-group"
+        log "➡️  Prompt initial sync"
         ;;
       "Changes Pending")
-        log "➡️  Règle appliquée : changes pending => config-sync to-group"
+        log "➡️  Prompt changements en attente"
         ;;
       "Not All Devices Synced")
-        log "➡️  Règle appliquée : retry sync => config-sync to-group"
+        log "➡️  Prompt relance de synchro"
         ;;
       *)
-        log "➡️  Règle appliquée : config-sync to-group"
+        log "➡️  Prompt standard"
         ;;
     esac
 
-    read -r -p "Lancer la synchronisation pour '$dg_full' ? (y/n) : " ans </dev/tty || ans="n"
+    prompt="$(build_status_prompt "$dg_full" "$st")"
+    read -r -p "$prompt" ans </dev/tty || ans="n"
+
     if [[ "${ans,,}" != "y" && "${ans,,}" != "yes" ]]; then
       log "⏭️  Ignoré."
       continue
