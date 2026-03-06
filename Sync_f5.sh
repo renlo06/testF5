@@ -71,7 +71,6 @@ rest_get_or_empty() {
 
 rest_post_cm_command() {
   local host="$1" cmd="$2" payload out rc
-
   payload="$(jq -n --arg c "$cmd" '{command:"run", utilCmdArgs:$c}')"
 
   dbg "POST https://${host}/mgmt/tm/cm"
@@ -98,10 +97,7 @@ get_failover_role_raw() {
   dump_json "failover-status/stats (${host})" "$js"
 
   jq -r '
-    def first_string($re):
-      [ .. | strings | select(test($re;"i")) ][0] // empty;
-    ( first_string("\\bACTIVE\\b") // first_string("\\bSTANDBY\\b") ) as $s
-    | if $s == "" then "UNKNOWN" else $s end
+    [ .. | strings | select(test("\\bACTIVE\\b|\\bSTANDBY\\b";"i")) ][0] // "UNKNOWN"
   ' <<<"$js" 2>/dev/null | head -n 1
 }
 
@@ -135,87 +131,29 @@ get_sync_stats_json() {
   echo "$js"
 }
 
-# dg_short<TAB>status
-extract_dg_status_tsv() {
-  local js="$1"
-  jq -r '
-    def allowed:
-      "In Sync|Awaiting Initial Sync|Changes Pending|Not All Devices Synced";
-
-    [ .. | strings
-      | select(test("\\((" + allowed + ")\\)"; "i"))
-    ]
-    | map(
-        capture("^(?<dg>[^\\(]+)\\s*\\((?<st>" + allowed + ")\\)")?
-        | select(. != null)
-        | {dg: (.dg|gsub("^\\s+";"")|gsub("\\s+$";"")), st: .st}
-      )
-    | .[]
-    | [.dg, .st] | @tsv
-  ' <<<"$js" 2>/dev/null || true
-}
-
-status_prio() {
-  case "$1" in
-    "In Sync") echo 0 ;;
-    "Awaiting Initial Sync") echo 1 ;;
-    "Not All Devices Synced") echo 2 ;;
-    "Changes Pending") echo 3 ;;
-    *) echo 0 ;;
-  esac
-}
-
 normalize_dg_name() {
   local dg="${1:-}"
   dg="${dg##*/}"
   printf "%s" "$dg"
 }
 
-run_config_sync_to_group() {
-  local host="$1" dg="$2"
-  local resp
+# Cherche le statut d'un DG donné dans sync-status/stats
+# Retourne: In Sync / Awaiting Initial Sync / Changes Pending / Not All Devices Synced / UNKNOWN
+get_dg_status_from_sync_json() {
+  local dg_short="$1"
+  local js="$2"
 
-  resp="$(rest_post_cm_command "$host" "config-sync to-group ${dg}")" || return 1
+  jq -r --arg dg "$dg_short" '
+    def allowed: "In Sync|Awaiting Initial Sync|Changes Pending|Not All Devices Synced";
 
-  local result
-  result="$(jq -r '.commandResult // empty' <<<"$resp" 2>/dev/null || true)"
-  if [[ -n "${result:-}" ]]; then
-    log "ℹ️  Retour API : $result"
-  fi
-
-  return 0
+    [ .. | strings
+      | select(test("^" + ($dg|gsub("\\\\";"\\\\\\\\")) + "\\s*\\((" + allowed + ")\\)"; "i"))
+      | capture("^" + ($dg|gsub("\\\\";"\\\\\\\\")) + "\\s*\\((?<st>" + allowed + ")\\)")
+      | .st
+    ][0] // "UNKNOWN"
+  ' <<<"$js" 2>/dev/null
 }
 
-poll_dg_until_in_sync() {
-  local host="$1" dg_full="$2"
-  local dg_short start now js
-
-  dg_short="$(normalize_dg_name "$dg_full")"
-  start="$(date +%s)"
-
-  while true; do
-    js="$(get_sync_stats_json "$host")"
-
-    if jq -e --arg dg "$dg_short" '
-      [ .. | strings
-        | select(test("^" + ($dg|gsub("\\\\";"\\\\\\\\")) + "\\s*\\(In Sync\\)"; "i"))
-      ] | length > 0
-    ' <<<"$js" >/dev/null 2>&1; then
-      log "✅ $dg_full : In Sync confirmé"
-      return 0
-    fi
-
-    now="$(date +%s)"
-    if (( now - start >= SYNC_POLL_TIMEOUT )); then
-      log "⏱️  Timeout (${SYNC_POLL_TIMEOUT}s) — $dg_full toujours pas In Sync"
-      return 1
-    fi
-
-    sleep "$SYNC_POLL_SLEEP"
-  done
-}
-
-# prompt adapté au statut
 build_status_prompt() {
   local dg="$1"
   local st="$2"
@@ -236,18 +174,60 @@ build_status_prompt() {
   esac
 }
 
+run_config_sync_to_group() {
+  local host="$1" dg="$2"
+  local resp
+
+  resp="$(rest_post_cm_command "$host" "config-sync to-group ${dg}")" || return 1
+
+  local result
+  result="$(jq -r '.commandResult // empty' <<<"$resp" 2>/dev/null || true)"
+  if [[ -n "${result:-}" ]]; then
+    log "ℹ️  Retour API : $result"
+  fi
+
+  return 0
+}
+
+poll_dg_until_in_sync() {
+  local host="$1" dg_full="$2"
+  local dg_short start now js st
+
+  dg_short="$(normalize_dg_name "$dg_full")"
+  start="$(date +%s)"
+
+  while true; do
+    js="$(get_sync_stats_json "$host")"
+    st="$(get_dg_status_from_sync_json "$dg_short" "$js")"
+    dbg "Polling $dg_full => $st"
+
+    if [[ "$st" == "In Sync" ]]; then
+      log "✅ $dg_full : In Sync confirmé"
+      return 0
+    fi
+
+    now="$(date +%s)"
+    if (( now - start >= SYNC_POLL_TIMEOUT )); then
+      log "⏱️  Timeout (${SYNC_POLL_TIMEOUT}s) — $dg_full toujours en statut: $st"
+      return 1
+    fi
+
+    sleep "$SYNC_POLL_SLEEP"
+  done
+}
+
 TOTAL=$(grep -Ev '^\s*#|^\s*$' "$DEVICES_FILE" | wc -l | awk '{print $1}')
 COUNT=0
 FAILS=0
 
 log ""
-log "🔁 HA ConfigSync — affichage de tous les device-groups"
+log "🔁 HA ConfigSync — prompt selon statut"
 log "Statuts pris en compte :"
 log "  - In Sync"
 log "  - Awaiting Initial Sync"
 log "  - Changes Pending"
 log "  - Not All Devices Synced"
-log "Règle : prompt selon statut, synchro lancée uniquement depuis l'ACTIVE et uniquement pour les sync-failover"
+log "Règle : prompt uniquement pour les sync-failover, depuis l'ACTIVE"
 log "Debug : $([[ $DEBUG -eq 1 ]] && echo ON || echo OFF)"
 log "Log   : $LOG_FILE"
 log ""
@@ -274,66 +254,46 @@ while IFS= read -r LINE || [[ -n "$LINE" ]]; do
     continue
   fi
 
+  JS="$(get_sync_stats_json "$HOST")"
+
   declare -A DG_FULL=()
   declare -A DG_TYPE=()
+  declare -A DG_STATUS=()
 
   while IFS=$'\t' read -r dg_full dg_type; do
     [[ -z "${dg_full:-}" || -z "${dg_type:-}" ]] && continue
     dg_short="$(normalize_dg_name "$dg_full")"
+
     DG_FULL["$dg_short"]="$dg_full"
     DG_TYPE["$dg_short"]="$dg_type"
-    dbg "DG déclaré: short=$dg_short full=$dg_full type=$dg_type"
+    DG_STATUS["$dg_short"]="$(get_dg_status_from_sync_json "$dg_short" "$JS")"
+
+    dbg "DG='$dg_full' type='$dg_type' status='${DG_STATUS[$dg_short]}'"
   done <<< "$DG_LIST_TSV"
-
-  JS="$(get_sync_stats_json "$HOST")"
-  DG_TSV="$(extract_dg_status_tsv "$JS")"
-
-  declare -A DG_STATUS=()
-  declare -A DG_PRIO=()
-
-  while IFS=$'\t' read -r dg_raw st; do
-    [[ -z "${dg_raw:-}" || -z "${st:-}" ]] && continue
-    dg_short="$(normalize_dg_name "$dg_raw")"
-
-    if [[ -z "${DG_FULL[$dg_short]+x}" ]]; then
-      dbg "DG ignoré (absent de cm device-group): raw='$dg_raw' short='$dg_short' status='$st'"
-      continue
-    fi
-
-    p="$(status_prio "$st")"
-    if [[ -z "${DG_STATUS[$dg_short]+x}" ]]; then
-      DG_STATUS["$dg_short"]="$st"
-      DG_PRIO["$dg_short"]="$p"
-    else
-      if (( p > DG_PRIO["$dg_short"] )); then
-        DG_STATUS["$dg_short"]="$st"
-        DG_PRIO["$dg_short"]="$p"
-      fi
-    fi
-  done <<< "$DG_TSV"
 
   log ""
   log "Device-groups détectés :"
   for dg_short in "${!DG_FULL[@]}"; do
-    dg_full="${DG_FULL[$dg_short]}"
-    dg_type="${DG_TYPE[$dg_short]}"
-    dg_status="${DG_STATUS[$dg_short]:-UNKNOWN}"
-    printf "  - %-35s : %-24s (%s)\n" "$dg_full" "$dg_status" "$dg_type" | tee -a "$LOG_FILE"
+    printf "  - %-35s : %-24s (%s)\n" \
+      "${DG_FULL[$dg_short]}" \
+      "${DG_STATUS[$dg_short]}" \
+      "${DG_TYPE[$dg_short]}" | tee -a "$LOG_FILE"
   done
 
   NEEDS=()
   for dg_short in "${!DG_FULL[@]}"; do
     if [[ "${DG_TYPE[$dg_short]}" == "sync-failover" ]]; then
-      st="${DG_STATUS[$dg_short]:-UNKNOWN}"
-      if [[ "$st" != "In Sync" && "$st" != "UNKNOWN" ]]; then
-        NEEDS+=("$dg_short")
-      fi
+      case "${DG_STATUS[$dg_short]}" in
+        "Awaiting Initial Sync"|"Changes Pending"|"Not All Devices Synced")
+          NEEDS+=("$dg_short")
+          ;;
+      esac
     fi
   done
 
   if [[ "${#NEEDS[@]}" -eq 0 ]]; then
     log ""
-    log "✅ Aucun device-group sync-failover à synchroniser."
+    log "✅ Aucun device-group sync-failover ne nécessite de synchronisation."
     log ""
     continue
   fi
@@ -353,27 +313,13 @@ while IFS= read -r LINE || [[ -n "$LINE" ]]; do
 
   for dg_short in "${NEEDS[@]}"; do
     dg_full="${DG_FULL[$dg_short]}"
+    dg_type="${DG_TYPE[$dg_short]}"
     st="${DG_STATUS[$dg_short]}"
 
     log "--------------------------------------"
     log "DG     : $dg_full"
-    log "Type   : ${DG_TYPE[$dg_short]}"
+    log "Type   : $dg_type"
     log "Status : $st"
-
-    case "$st" in
-      "Awaiting Initial Sync")
-        log "➡️  Prompt initial sync"
-        ;;
-      "Changes Pending")
-        log "➡️  Prompt changements en attente"
-        ;;
-      "Not All Devices Synced")
-        log "➡️  Prompt relance de synchro"
-        ;;
-      *)
-        log "➡️  Prompt standard"
-        ;;
-    esac
 
     prompt="$(build_status_prompt "$dg_full" "$st")"
     read -r -p "$prompt" ans </dev/tty || ans="n"
