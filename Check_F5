@@ -171,4 +171,4 @@ EOF
         ((k++))
     fi
 
-done < "$HOSTS"
+done < "$DEVICES_FILE"
