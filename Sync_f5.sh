@@ -207,6 +207,9 @@ decide_action() {
     yellow\|Changes\ Pending)
       echo "sync"
       ;;
+    red\|Changes\ Pending)
+      echo "force"
+      ;;
     red\|Not\ All\ Devices\ Synced)
       echo "force"
       ;;
@@ -313,6 +316,7 @@ log "🔁 HA ConfigSync — règles basées sur Color + Sync Status"
 log "Règles appliquées :"
 log "  - Blue + Awaiting Initial Sync     => config-sync to-group"
 log "  - Yellow + Changes Pending         => config-sync to-group"
+log "  - Red + Changes Pending            => force-full-load-push to-group"
 log "  - Red + Not All Devices Synced     => force-full-load-push to-group"
 log "  - Green + Syncing                  => aucune action"
 log "  - In Sync                          => aucune action"
