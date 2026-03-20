@@ -134,7 +134,6 @@ normalize_role() {
 #######################################
 # DEVICE-GROUPS
 #######################################
-# fullPath<TAB>type
 get_all_device_groups_tsv() {
   local host="$1" js
   js="$(rest_get_or_empty "$host" "/mgmt/tm/cm/device-group?\$select=fullPath,type" || true)"
@@ -162,8 +161,6 @@ get_sync_stats_json() {
   echo "$js"
 }
 
-# Cherche le statut pour un DG donné
-# Retourne: In Sync / Awaiting Initial Sync / Changes Pending / Not All Devices Synced / Syncing / UNKNOWN
 get_dg_status_from_sync_json() {
   local dg_short="$1"
   local js="$2"
@@ -179,7 +176,6 @@ get_dg_status_from_sync_json() {
   ' <<<"$js" 2>/dev/null
 }
 
-# Couleur globale du sync-status
 get_sync_color_from_sync_json() {
   local js="$1"
   jq -r '
@@ -192,10 +188,6 @@ get_sync_color_from_sync_json() {
 #######################################
 # RULES
 #######################################
-# Retourne l'action à lancer selon status + color :
-#   sync   => config-sync to-group
-#   force  => config-sync force-full-load-push to-group
-#   none   => aucune action
 decide_action() {
   local status="$1"
   local color="$2"
@@ -205,6 +197,9 @@ decide_action() {
       echo "sync"
       ;;
     yellow\|Changes\ Pending)
+      echo "sync"
+      ;;
+    yellow\|Not\ All\ Devices\ Synced)
       echo "sync"
       ;;
     red\|Changes\ Pending)
@@ -227,19 +222,23 @@ decide_action() {
 
 build_status_prompt() {
   local dg="$1"
-  local status="$2"
-  local color="$3"
-  local action="$4"
+  local dg_type="$2"
+  local status="$3"
+  local color="$4"
+  local action="$5"
 
   case "$action" in
     force)
-      printf "DG '%s' : color=%s, status=%s. Forcer la synchronisation (force-full-load-push) ? (y/n) : " "$dg" "$color" "$status"
+      printf "DG '%s' (%s) : color=%s, status=%s. Forcer la synchronisation (force-full-load-push) ? (y/n) : " \
+        "$dg" "$dg_type" "$color" "$status"
       ;;
     sync)
-      printf "DG '%s' : color=%s, status=%s. Lancer la synchronisation ? (y/n) : " "$dg" "$color" "$status"
+      printf "DG '%s' (%s) : color=%s, status=%s. Lancer la synchronisation ? (y/n) : " \
+        "$dg" "$dg_type" "$color" "$status"
       ;;
     *)
-      printf "DG '%s' : color=%s, status=%s. Aucune action requise. " "$dg" "$color" "$status"
+      printf "DG '%s' (%s) : color=%s, status=%s. Aucune action requise. " \
+        "$dg" "$dg_type" "$color" "$status"
       ;;
   esac
 }
@@ -316,11 +315,13 @@ log "🔁 HA ConfigSync — règles basées sur Color + Sync Status"
 log "Règles appliquées :"
 log "  - Blue + Awaiting Initial Sync     => config-sync to-group"
 log "  - Yellow + Changes Pending         => config-sync to-group"
+log "  - Yellow + Not All Devices Synced  => config-sync to-group"
 log "  - Red + Changes Pending            => force-full-load-push to-group"
 log "  - Red + Not All Devices Synced     => force-full-load-push to-group"
 log "  - Green + Syncing                  => aucune action"
 log "  - In Sync                          => aucune action"
-log "Règle complémentaire : action uniquement depuis l'ACTIVE"
+log "Périmètre : sync-failover + sync-only"
+log "Règle absolue : toute demande de synchronisation se fait uniquement depuis l'ACTIVE"
 log "Debug : $([[ $DEBUG -eq 1 ]] && echo ON || echo OFF)"
 log "Log   : $LOG_FILE"
 log ""
@@ -377,9 +378,10 @@ while IFS= read -r LINE || [[ -n "$LINE" ]]; do
       "${DG_TYPE[$dg_short]}" | tee -a "$LOG_FILE"
   done
 
+  # On identifie seulement les groupes qui demanderaient une action
   NEEDS=()
   for dg_short in "${!DG_FULL[@]}"; do
-    if [[ "${DG_TYPE[$dg_short]}" == "sync-failover" ]]; then
+    if [[ "${DG_TYPE[$dg_short]}" == "sync-failover" || "${DG_TYPE[$dg_short]}" == "sync-only" ]]; then
       if [[ "${DG_ACTION[$dg_short]}" == "sync" || "${DG_ACTION[$dg_short]}" == "force" ]]; then
         NEEDS+=("$dg_short")
       fi
@@ -388,20 +390,21 @@ while IFS= read -r LINE || [[ -n "$LINE" ]]; do
 
   if [[ "${#NEEDS[@]}" -eq 0 ]]; then
     log ""
-    log "✅ Aucun device-group sync-failover ne nécessite d'action selon les règles."
+    log "✅ Aucun device-group ne nécessite d'action selon les règles."
     log ""
     continue
   fi
 
   log ""
-  log "⚠️  Device-groups sync-failover nécessitant une action : ${#NEEDS[@]}"
+  log "⚠️  Device-groups nécessitant une action : ${#NEEDS[@]}"
   for dg_short in "${NEEDS[@]}"; do
-    log "  * ${DG_FULL[$dg_short]} : status=${DG_STATUS[$dg_short]} color=${GLOBAL_COLOR} action=${DG_ACTION[$dg_short]}"
+    log "  * ${DG_FULL[$dg_short]} (${DG_TYPE[$dg_short]}) : status=${DG_STATUS[$dg_short]} color=${GLOBAL_COLOR} action=${DG_ACTION[$dg_short]}"
   done
   log ""
 
+  # RÈGLE ABSOLUE : aucun prompt tant qu'on n'est pas ACTIVE
   if [[ "$ROLE" != "ACTIVE" ]]; then
-    log "ℹ️  Non-ACTIVE => aucune synchronisation lancée."
+    log "ℹ️  Équipement non ACTIVE => aucune demande de synchronisation."
     log ""
     continue
   fi
@@ -419,7 +422,7 @@ while IFS= read -r LINE || [[ -n "$LINE" ]]; do
     log "Color  : $GLOBAL_COLOR"
     log "Action : $action"
 
-    prompt="$(build_status_prompt "$dg_full" "$st" "$GLOBAL_COLOR" "$action")"
+    prompt="$(build_status_prompt "$dg_full" "$dg_type" "$st" "$GLOBAL_COLOR" "$action")"
     read -r -p "$prompt" ans </dev/tty || ans="n"
 
     if [[ "${ans,,}" != "y" && "${ans,,}" != "yes" ]]; then
