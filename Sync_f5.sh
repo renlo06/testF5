@@ -84,12 +84,13 @@ rest_get_or_empty() {
   return 0
 }
 
-rest_post_cm_command() {
-  local host="$1" cmd="$2" payload out rc
+# ✅ endpoint corrigé
+rest_post_config_sync() {
+  local host="$1" util_args="$2" payload out rc
 
-  payload="$(jq -n --arg c "$cmd" '{command:"run", utilCmdArgs:$c}')"
+  payload="$(jq -n --arg a "$util_args" '{command:"run", utilCmdArgs:$a}')"
 
-  dbg "POST https://${host}/mgmt/tm/cm"
+  dbg "POST https://${host}/mgmt/tm/cm/config-sync"
   dbg "POST payload: $payload"
 
   set +e
@@ -97,14 +98,19 @@ rest_post_cm_command() {
     -H "Content-Type: application/json" \
     -X POST \
     -d "$payload" \
-    "https://${host}/mgmt/tm/cm")"
+    "https://${host}/mgmt/tm/cm/config-sync")"
   rc=$?
   set -e
 
   dbg "POST rc=$rc"
-  dump_json "POST /mgmt/tm/cm response (${host})" "$out"
+  dump_json "POST /mgmt/tm/cm/config-sync response (${host})" "$out"
 
-  [[ $rc -eq 0 ]]
+  if [[ $rc -ne 0 ]]; then
+    return 1
+  fi
+
+  echo "$out"
+  return 0
 }
 
 #######################################
@@ -134,6 +140,7 @@ normalize_role() {
 #######################################
 # DEVICE-GROUPS
 #######################################
+# fullPath<TAB>type
 get_all_device_groups_tsv() {
   local host="$1" js
   js="$(rest_get_or_empty "$host" "/mgmt/tm/cm/device-group?\$select=fullPath,type" || true)"
@@ -161,6 +168,7 @@ get_sync_stats_json() {
   echo "$js"
 }
 
+# Retourne: In Sync / Awaiting Initial Sync / Changes Pending / Not All Devices Synced / Syncing / UNKNOWN
 get_dg_status_from_sync_json() {
   local dg_short="$1"
   local js="$2"
@@ -188,30 +196,33 @@ get_sync_color_from_sync_json() {
 #######################################
 # RULES
 #######################################
+# sync  => config-sync to-group
+# force => config-sync force-full-load-push to-group
+# none  => aucune action
 decide_action() {
   local status="$1"
   local color="$2"
 
-  case "${color}|${status}" in
-    blue\|Awaiting\ Initial\ Sync)
+  case "${status}|${color}" in
+    "Awaiting Initial Sync|blue")
       echo "sync"
       ;;
-    yellow\|Changes\ Pending)
-      echo "sync"
-      ;;
-    yellow\|Not\ All\ Devices\ Synced)
-      echo "sync"
-      ;;
-    red\|Changes\ Pending)
+    "Changes Pending|yellow")
       echo "force"
       ;;
-    red\|Not\ All\ Devices\ Synced)
+    "Changes Pending|red")
       echo "force"
       ;;
-    green\|Syncing)
+    "Not All Devices Synced|yellow")
+      echo "sync"
+      ;;
+    "Not All Devices Synced|red")
+      echo "force"
+      ;;
+    "Syncing|green")
       echo "none"
       ;;
-    *\|In\ Sync)
+    "In Sync|"*)
       echo "none"
       ;;
     *)
@@ -248,12 +259,11 @@ build_status_prompt() {
 #######################################
 run_config_sync_to_group() {
   local host="$1" dg="$2"
-  local resp
+  local resp result
 
-  resp="$(rest_post_cm_command "$host" "config-sync to-group ${dg}")" || return 1
-
-  local result
+  resp="$(rest_post_config_sync "$host" "to-group $dg")" || return 1
   result="$(jq -r '.commandResult // empty' <<<"$resp" 2>/dev/null || true)"
+
   if [[ -n "${result:-}" ]]; then
     log "ℹ️  Retour API : $result"
   fi
@@ -263,12 +273,11 @@ run_config_sync_to_group() {
 
 run_force_full_load_push_to_group() {
   local host="$1" dg="$2"
-  local resp
+  local resp result
 
-  resp="$(rest_post_cm_command "$host" "config-sync force-full-load-push to-group ${dg}")" || return 1
-
-  local result
+  resp="$(rest_post_config_sync "$host" "force-full-load-push to-group $dg")" || return 1
   result="$(jq -r '.commandResult // empty' <<<"$resp" 2>/dev/null || true)"
+
   if [[ -n "${result:-}" ]]; then
     log "ℹ️  Retour API : $result"
   fi
@@ -314,9 +323,9 @@ log ""
 log "🔁 HA ConfigSync — règles basées sur Color + Sync Status"
 log "Règles appliquées :"
 log "  - Blue + Awaiting Initial Sync     => config-sync to-group"
-log "  - Yellow + Changes Pending         => config-sync to-group"
-log "  - Yellow + Not All Devices Synced  => config-sync to-group"
+log "  - Yellow + Changes Pending         => force-full-load-push to-group"
 log "  - Red + Changes Pending            => force-full-load-push to-group"
+log "  - Yellow + Not All Devices Synced  => config-sync to-group"
 log "  - Red + Not All Devices Synced     => force-full-load-push to-group"
 log "  - Green + Syncing                  => aucune action"
 log "  - In Sync                          => aucune action"
@@ -378,7 +387,6 @@ while IFS= read -r LINE || [[ -n "$LINE" ]]; do
       "${DG_TYPE[$dg_short]}" | tee -a "$LOG_FILE"
   done
 
-  # On identifie seulement les groupes qui demanderaient une action
   NEEDS=()
   for dg_short in "${!DG_FULL[@]}"; do
     if [[ "${DG_TYPE[$dg_short]}" == "sync-failover" || "${DG_TYPE[$dg_short]}" == "sync-only" ]]; then
@@ -402,7 +410,6 @@ while IFS= read -r LINE || [[ -n "$LINE" ]]; do
   done
   log ""
 
-  # RÈGLE ABSOLUE : aucun prompt tant qu'on n'est pas ACTIVE
   if [[ "$ROLE" != "ACTIVE" ]]; then
     log "ℹ️  Équipement non ACTIVE => aucune demande de synchronisation."
     log ""
