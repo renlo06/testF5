@@ -84,7 +84,6 @@ rest_get_or_empty() {
   return 0
 }
 
-# ✅ endpoint corrigé
 rest_post_config_sync() {
   local host="$1" util_args="$2" payload out rc
 
@@ -286,8 +285,10 @@ run_force_full_load_push_to_group() {
 }
 
 poll_dg_until_in_sync() {
-  local host="$1" dg_full="$2"
-  local dg_short start now js st
+  local host="$1"
+  local dg_full="$2"
+  local dg_type="$3"
+  local dg_short start now js st color action
 
   dg_short="$(normalize_dg_name "$dg_full")"
   start="$(date +%s)"
@@ -295,16 +296,26 @@ poll_dg_until_in_sync() {
   while true; do
     js="$(get_sync_stats_json "$host")"
     st="$(get_dg_status_from_sync_json "$dg_short" "$js")"
-    dbg "Polling $dg_full => $st"
+    color="$(get_sync_color_from_sync_json "$js")"
+    action="$(decide_action "$st" "$color")"
+
+    dbg "Polling $dg_full (type=$dg_type) => status='$st' color='$color' action='$action'"
 
     if [[ "$st" == "In Sync" ]]; then
       log "✅ $dg_full : In Sync confirmé"
       return 0
     fi
 
+    # Correction sync-only :
+    # si le groupe ne remonte plus d'action à faire, on le considère synchronisé
+    if [[ "$dg_type" == "sync-only" && "$action" == "none" && "$st" != "UNKNOWN" ]]; then
+      log "✅ $dg_full : synchronisation considérée OK (sync-only, plus d'action requise, status=$st)"
+      return 0
+    fi
+
     now="$(date +%s)"
     if (( now - start >= SYNC_POLL_TIMEOUT )); then
-      log "⏱️  Timeout (${SYNC_POLL_TIMEOUT}s) — $dg_full toujours en statut: $st"
+      log "⏱️  Timeout (${SYNC_POLL_TIMEOUT}s) — $dg_full toujours en statut: $st (color=$color, action=$action)"
       return 1
     fi
 
@@ -454,7 +465,7 @@ while IFS= read -r LINE || [[ -n "$LINE" ]]; do
     fi
 
     log "⏳ Attente du retour In Sync pour $dg_full..."
-    if ! poll_dg_until_in_sync "$HOST" "$dg_full"; then
+    if ! poll_dg_until_in_sync "$HOST" "$dg_full" "$dg_type"; then
       FAILS=$((FAILS+1))
     fi
   done
