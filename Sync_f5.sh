@@ -186,16 +186,26 @@ get_sync_color_from_json() {
   ' <<<"$js" 2>/dev/null | tr '[:upper:]' '[:lower:]'
 }
 
+# ✅ Correction: recherche du statut par device-group dans les descriptions détaillées
 get_dg_status_from_sync_json() {
-  local dg_short="$1"
+  local dg_full="$1"
   local js="$2"
+  local dg_short
 
-  jq -r --arg dg "$dg_short" '
+  dg_short="$(normalize_dg_name "$dg_full")"
+
+  jq -r --arg dg_full "$dg_full" --arg dg_short "$dg_short" '
     def allowed: "In Sync|Awaiting Initial Sync|Changes Pending|Not All Devices Synced|Syncing";
 
-    [ .. | strings
-      | select(test("^" + ($dg|gsub("\\\\";"\\\\\\\\")) + "\\s*\\((" + allowed + ")\\)"; "i"))
-      | capture("^" + ($dg|gsub("\\\\";"\\\\\\\\")) + "\\s*\\((?<st>" + allowed + ")\\)")
+    [
+      .. | objects | .description? // empty
+      | select(type=="string")
+      | select(
+          test("(^|/)" + ($dg_short|gsub("\\\\";"\\\\\\\\")) + "\\s*\\((" + allowed + ")\\)"; "i")
+          or
+          test(($dg_full|gsub("\\\\";"\\\\\\\\")) + "\\s*\\((" + allowed + ")\\)"; "i")
+        )
+      | capture("(?<st>" + allowed + ")")
       | .st
     ][0] // "UNKNOWN"
   ' <<<"$js" 2>/dev/null
@@ -298,50 +308,46 @@ poll_dg_until_in_sync() {
   local dg_full="$2"
   local dg_type="$3"
 
-  local dg_short start now js dg_status global_status color action
+  local start now js dg_status global_status color
 
-  dg_short="$(normalize_dg_name "$dg_full")"
   start="$(date +%s)"
 
   while true; do
     js="$(get_sync_stats_json "$host")"
-    dg_status="$(get_dg_status_from_sync_json "$dg_short" "$js")"
+    dg_status="$(get_dg_status_from_sync_json "$dg_full" "$js")"
     global_status="$(get_global_sync_status_from_json "$js")"
     color="$(get_sync_color_from_json "$js")"
-    action="$(decide_action "$dg_status" "$color")"
 
-    dbg "Polling $dg_full (type=$dg_type) => dg_status='$dg_status' global_status='$global_status' color='$color' action='$action'"
+    dbg "Polling $dg_full (type=$dg_type) => dg_status='$dg_status' global_status='$global_status' color='$color'"
 
+    ########################################
+    # sync-failover : validation stricte sur le DG ciblé
+    ########################################
     if [[ "$dg_type" == "sync-failover" ]]; then
-      if [[ "$dg_status" == "In Sync" || "$global_status" == "In Sync" ]]; then
+      if [[ "$dg_status" == "In Sync" ]]; then
         log "✅ $dg_full : In Sync confirmé"
         return 0
       fi
     fi
 
+    ########################################
+    # sync-only : validation plus souple
+    ########################################
     if [[ "$dg_type" == "sync-only" ]]; then
-      # Cas 1 : le DG devient explicitement In Sync
       if [[ "$dg_status" == "In Sync" ]]; then
         log "✅ $dg_full : In Sync confirmé"
         return 0
       fi
 
-      # Cas 2 : plus de Changes Pending global
-      if [[ "$global_status" != "Changes Pending" ]]; then
+      if [[ "$dg_status" == "UNKNOWN" && "$global_status" != "Changes Pending" ]]; then
         log "✅ $dg_full : synchronisation OK (sync-only, plus de Changes Pending global)"
-        return 0
-      fi
-
-      # Cas 3 : le DG reste UNKNOWN mais plus d'action n'est requise globalement
-      if [[ "$dg_status" == "UNKNOWN" && "$color" != "yellow" && "$color" != "red" ]]; then
-        log "✅ $dg_full : synchronisation considérée OK (sync-only, état global stabilisé)"
         return 0
       fi
     fi
 
     now="$(date +%s)"
     if (( now - start >= SYNC_POLL_TIMEOUT )); then
-      log "⏱️  Timeout (${SYNC_POLL_TIMEOUT}s) — $dg_full dg_status=$dg_status global_status=$global_status color=$color action=$action"
+      log "⏱️  Timeout (${SYNC_POLL_TIMEOUT}s) — $dg_full dg_status=$dg_status global_status=$global_status color=$color"
       return 1
     fi
 
@@ -389,7 +395,7 @@ COUNT=0
 FAILS=0
 
 log ""
-log "🔁 HA ConfigSync — version robuste"
+log "🔁 HA ConfigSync — version robuste corrigée"
 log "Règles appliquées :"
 log "  - Blue + Awaiting Initial Sync     => config-sync to-group"
 log "  - Yellow + Changes Pending         => force-full-load-push to-group"
@@ -442,7 +448,7 @@ while IFS= read -r LINE || [[ -n "$LINE" ]]; do
 
     DG_FULL["$dg_short"]="$dg_full"
     DG_TYPE["$dg_short"]="$dg_type"
-    DG_STATUS["$dg_short"]="$(get_dg_status_from_sync_json "$dg_short" "$JS")"
+    DG_STATUS["$dg_short"]="$(get_dg_status_from_sync_json "$dg_full" "$JS")"
     DG_ACTION["$dg_short"]="$(decide_action "${DG_STATUS[$dg_short]}" "$GLOBAL_COLOR")"
 
     dbg "DG='$dg_full' type='$dg_type' dg_status='${DG_STATUS[$dg_short]}' global_status='$GLOBAL_STATUS' color='$GLOBAL_COLOR' action='${DG_ACTION[$dg_short]}'"
