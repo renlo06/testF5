@@ -122,7 +122,7 @@ rest_post_config_sync() {
 }
 
 #######################################
-# HA ROLE
+# FAILOVER / HA
 #######################################
 get_failover_status_json() {
   local host="$1" js
@@ -133,17 +133,20 @@ get_failover_status_json() {
 
 get_failover_role_raw() {
   local js="$1"
+
   jq -r '
-    [ .. | strings | select(test("\\bACTIVE\\b|\\bSTANDBY\\b"; "i")) ][0] // "UNKNOWN"
-  ' <<<"$js" 2>/dev/null | head -n 1
+    .entries
+    | to_entries[0].value.nestedStats.entries.status.description
+    // "UNKNOWN"
+  ' <<<"$js" 2>/dev/null
 }
 
 normalize_role() {
   local raw
   raw="$(normalize_text "${1:-}")"
-  if grep -qi "\bACTIVE\b" <<<"$raw"; then
+  if [[ "$raw" == "ACTIVE" ]]; then
     echo "ACTIVE"
-  elif grep -qi "\bSTANDBY\b" <<<"$raw"; then
+  elif [[ "$raw" == "STANDBY" ]]; then
     echo "STANDBY"
   else
     echo "UNKNOWN"
@@ -165,7 +168,7 @@ get_all_device_groups_tsv() {
   jq -r '
     (.items // [])[]
     | [.fullPath, .type] | @tsv
-  ' <<<"$js" 2>/dev/null || true
+  ' <<<"$js" 2>/dev/null
 }
 
 get_sync_stats_json() {
@@ -177,19 +180,21 @@ get_sync_stats_json() {
 
 get_global_sync_status_from_json() {
   local js="$1"
+
   jq -r '
-    [ .. | objects | .status? | .description? ]
-    | map(select(type=="string" and .!=""))
-    | .[0] // ""
+    .entries
+    | to_entries[0].value.nestedStats.entries.status.description
+    // ""
   ' <<<"$js" 2>/dev/null
 }
 
 get_sync_color_from_json() {
   local js="$1"
+
   jq -r '
-    [ .. | objects | .color? | .description? ]
-    | map(select(type=="string" and .!=""))
-    | .[0] // ""
+    .entries
+    | to_entries[0].value.nestedStats.entries.color.description
+    // ""
   ' <<<"$js" 2>/dev/null
 }
 
@@ -206,18 +211,20 @@ get_dg_status_from_sync_json() {
 
   dg_short="$(normalize_dg_name "$dg_full")"
 
-  jq -r --arg dg_full "$dg_full" --arg dg_short "$dg_short" '
+  jq -r --arg dg "$dg_short" '
     def allowed: "In Sync|Awaiting Initial Sync|Changes Pending|Not All Devices Synced|Syncing";
 
     [
-      .. | objects | .description? // empty
+      .entries
+      | to_entries[0].value.nestedStats.entries
+      | to_entries[]
+      | select(.key | test("/details/stats$"))
+      | .value.nestedStats.entries
+      | to_entries[]
+      | .value.nestedStats.entries.details.description
       | select(type=="string")
-      | select(
-          test("(^|/)" + ($dg_short|gsub("\\\\";"\\\\\\\\")) + "\\s*\\((" + allowed + ")\\)"; "i")
-          or
-          test(($dg_full|gsub("\\\\";"\\\\\\\\")) + "\\s*\\((" + allowed + ")\\)"; "i")
-        )
-      | capture("(?<st>" + allowed + ")")
+      | select(test("^" + $dg + " \\((" + allowed + ")\\)"; "i"))
+      | capture("^" + $dg + " \\((?<st>" + allowed + ")\\)")
       | .st
     ][0] // "UNKNOWN"
   ' <<<"$js" 2>/dev/null
@@ -368,7 +375,7 @@ build_current_lists() {
   sync_js="$(get_sync_stats_json "$host")"
   dg_js="$(get_device_groups_json "$host")"
 
-  CURRENT_ROLE_RAW="$(get_failover_role_raw "$failover_js")"
+  CURRENT_ROLE_RAW="$(normalize_text "$(get_failover_role_raw "$failover_js")")"
   CURRENT_ROLE="$(normalize_role "$CURRENT_ROLE_RAW")"
   CURRENT_GLOBAL_STATUS="$(normalize_text "$(get_global_sync_status_from_json "$sync_js")")"
   CURRENT_GLOBAL_COLOR="$(normalize_lower "$(get_sync_color_from_json "$sync_js")")"
@@ -421,7 +428,7 @@ COUNT=0
 FAILS=0
 
 log ""
-log "🔁 HA ConfigSync — version corrigée"
+log "🔁 HA ConfigSync — parseurs exacts"
 log "Règle absolue : synchronisation uniquement depuis l'ACTIVE"
 log "Priorité : sync-failover puis sync-only"
 log "Fallback : sync standard -> force-full-load-push si échec"
