@@ -186,7 +186,6 @@ get_sync_color_from_json() {
   ' <<<"$js" 2>/dev/null | tr '[:upper:]' '[:lower:]'
 }
 
-# ✅ Correction: recherche du statut par device-group dans les descriptions détaillées
 get_dg_status_from_sync_json() {
   local dg_full="$1"
   local js="$2"
@@ -255,7 +254,7 @@ build_status_prompt() {
 
   case "$action" in
     force)
-      printf "DG '%s' (%s) : color=%s, status=%s. Forcer la synchronisation (force-full-load-push) ? (y/n) : " \
+      printf "DG '%s' (%s) : color=%s, status=%s. Forcer la synchronisation ? (y/n) : " \
         "$dg" "$dg_type" "$color" "$status"
       ;;
     sync)
@@ -278,11 +277,7 @@ run_config_sync_to_group() {
 
   resp="$(rest_post_config_sync "$host" "to-group $dg")" || return 1
   result="$(jq -r '.commandResult // empty' <<<"$resp" 2>/dev/null || true)"
-
-  if [[ -n "${result:-}" ]]; then
-    log "ℹ️  Retour API : $result"
-  fi
-
+  [[ -n "${result:-}" ]] && log "ℹ️  Retour API : $result"
   return 0
 }
 
@@ -292,11 +287,7 @@ run_force_full_load_push_to_group() {
 
   resp="$(rest_post_config_sync "$host" "force-full-load-push to-group $dg")" || return 1
   result="$(jq -r '.commandResult // empty' <<<"$resp" 2>/dev/null || true)"
-
-  if [[ -n "${result:-}" ]]; then
-    log "ℹ️  Retour API : $result"
-  fi
-
+  [[ -n "${result:-}" ]] && log "ℹ️  Retour API : $result"
   return 0
 }
 
@@ -320,9 +311,6 @@ poll_dg_until_in_sync() {
 
     dbg "Polling $dg_full (type=$dg_type) => dg_status='$dg_status' global_status='$global_status' color='$color'"
 
-    ########################################
-    # sync-failover : validation stricte sur le DG ciblé
-    ########################################
     if [[ "$dg_type" == "sync-failover" ]]; then
       if [[ "$dg_status" == "In Sync" ]]; then
         log "✅ $dg_full : In Sync confirmé"
@@ -330,9 +318,6 @@ poll_dg_until_in_sync() {
       fi
     fi
 
-    ########################################
-    # sync-only : validation plus souple
-    ########################################
     if [[ "$dg_type" == "sync-only" ]]; then
       if [[ "$dg_status" == "In Sync" ]]; then
         log "✅ $dg_full : In Sync confirmé"
@@ -362,29 +347,69 @@ run_action_with_validation() {
   local action="$4"
 
   if [[ "$action" == "force" ]]; then
-    log "🚀 Lancement : config-sync force-full-load-push to-group $dg_full"
+    log "🚀 Lancement : force-full-load-push to-group $dg_full"
     run_force_full_load_push_to_group "$host" "$dg_full" || return 1
-    log "⏳ Attente du retour In Sync pour $dg_full..."
+    log "⏳ Vérification du groupe..."
     poll_dg_until_in_sync "$host" "$dg_full" "$dg_type"
     return $?
   fi
 
   log "🚀 Lancement : config-sync to-group $dg_full"
   run_config_sync_to_group "$host" "$dg_full" || return 1
-  log "⏳ Attente du retour In Sync pour $dg_full..."
+  log "⏳ Vérification du groupe..."
   if poll_dg_until_in_sync "$host" "$dg_full" "$dg_type"; then
     return 0
   fi
 
   if (( SYNC_RETRY_FORCE_ON_FAILURE == 1 )); then
-    log "⚠️  Échec/timeout après sync standard pour $dg_full -> tentative fallback force-full-load-push"
+    log "⚠️  Fallback : retry en force-full-load-push pour $dg_full"
     run_force_full_load_push_to_group "$host" "$dg_full" || return 1
-    log "⏳ Attente du retour In Sync après fallback pour $dg_full..."
+    log "⏳ Vérification du groupe après fallback..."
     poll_dg_until_in_sync "$host" "$dg_full" "$dg_type"
     return $?
   fi
 
   return 1
+}
+
+#######################################
+# BUILD CURRENT STATE
+#######################################
+build_current_state() {
+  local host="$1"
+
+  CURRENT_JS="$(get_sync_stats_json "$host")"
+  CURRENT_GLOBAL_COLOR="$(get_sync_color_from_json "$CURRENT_JS")"
+  CURRENT_GLOBAL_STATUS="$(get_global_sync_status_from_json "$CURRENT_JS")"
+  CURRENT_DG_LIST_TSV="$(get_all_device_groups_tsv "$host" || true)"
+
+  declare -gA DG_FULL_MAP=()
+  declare -gA DG_TYPE_MAP=()
+  declare -gA DG_STATUS_MAP=()
+  declare -gA DG_ACTION_MAP=()
+
+  while IFS=$'\t' read -r dg_full dg_type; do
+    [[ -z "${dg_full:-}" || -z "${dg_type:-}" ]] && continue
+    dg_short="$(normalize_dg_name "$dg_full")"
+
+    DG_FULL_MAP["$dg_short"]="$dg_full"
+    DG_TYPE_MAP["$dg_short"]="$dg_type"
+    DG_STATUS_MAP["$dg_short"]="$(get_dg_status_from_sync_json "$dg_full" "$CURRENT_JS")"
+    DG_ACTION_MAP["$dg_short"]="$(decide_action "${DG_STATUS_MAP[$dg_short]}" "$CURRENT_GLOBAL_COLOR")"
+
+    dbg "STATE DG='$dg_full' type='$dg_type' dg_status='${DG_STATUS_MAP[$dg_short]}' global_status='$CURRENT_GLOBAL_STATUS' color='$CURRENT_GLOBAL_COLOR' action='${DG_ACTION_MAP[$dg_short]}'"
+  done <<< "$CURRENT_DG_LIST_TSV"
+}
+
+list_needs() {
+  NEEDS=()
+  for dg_short in "${!DG_FULL_MAP[@]}"; do
+    if [[ "${DG_TYPE_MAP[$dg_short]}" == "sync-failover" || "${DG_TYPE_MAP[$dg_short]}" == "sync-only" ]]; then
+      if [[ "${DG_ACTION_MAP[$dg_short]}" == "sync" || "${DG_ACTION_MAP[$dg_short]}" == "force" ]]; then
+        NEEDS+=("$dg_short")
+      fi
+    fi
+  done
 }
 
 #######################################
@@ -395,16 +420,7 @@ COUNT=0
 FAILS=0
 
 log ""
-log "🔁 HA ConfigSync — version robuste corrigée"
-log "Règles appliquées :"
-log "  - Blue + Awaiting Initial Sync     => config-sync to-group"
-log "  - Yellow + Changes Pending         => force-full-load-push to-group"
-log "  - Red + Changes Pending            => force-full-load-push to-group"
-log "  - Yellow + Not All Devices Synced  => config-sync to-group"
-log "  - Red + Not All Devices Synced     => force-full-load-push to-group"
-log "  - Green + Syncing                  => aucune action"
-log "  - In Sync                          => aucune action"
-log "Périmètre : sync-failover + sync-only"
+log "🔁 HA ConfigSync — recalcul dynamique des groupes"
 log "Règle absolue : toute demande de synchronisation se fait uniquement depuis l'ACTIVE"
 log "Fallback : sync standard -> force-full-load-push si échec"
 log "Debug : $([[ $DEBUG -eq 1 ]] && echo ON || echo OFF)"
@@ -426,54 +442,21 @@ while IFS= read -r LINE || [[ -n "$LINE" ]]; do
   log "Role brut : ${ROLE_RAW:-UNKNOWN}"
   log "Role norm : ${ROLE}"
 
-  DG_LIST_TSV="$(get_all_device_groups_tsv "$HOST" || true)"
-  if [[ -z "${DG_LIST_TSV:-}" ]]; then
-    log "⚠️  Aucun device-group trouvé."
-    log ""
-    continue
-  fi
+  build_current_state "$HOST"
 
-  JS="$(get_sync_stats_json "$HOST")"
-  GLOBAL_COLOR="$(get_sync_color_from_json "$JS")"
-  GLOBAL_STATUS="$(get_global_sync_status_from_json "$JS")"
-
-  declare -A DG_FULL=()
-  declare -A DG_TYPE=()
-  declare -A DG_STATUS=()
-  declare -A DG_ACTION=()
-
-  while IFS=$'\t' read -r dg_full dg_type; do
-    [[ -z "${dg_full:-}" || -z "${dg_type:-}" ]] && continue
-    dg_short="$(normalize_dg_name "$dg_full")"
-
-    DG_FULL["$dg_short"]="$dg_full"
-    DG_TYPE["$dg_short"]="$dg_type"
-    DG_STATUS["$dg_short"]="$(get_dg_status_from_sync_json "$dg_full" "$JS")"
-    DG_ACTION["$dg_short"]="$(decide_action "${DG_STATUS[$dg_short]}" "$GLOBAL_COLOR")"
-
-    dbg "DG='$dg_full' type='$dg_type' dg_status='${DG_STATUS[$dg_short]}' global_status='$GLOBAL_STATUS' color='$GLOBAL_COLOR' action='${DG_ACTION[$dg_short]}'"
-  done <<< "$DG_LIST_TSV"
-
+  log "Status global : $CURRENT_GLOBAL_STATUS"
+  log "Color global  : $CURRENT_GLOBAL_COLOR"
   log ""
-  log "Status global : $GLOBAL_STATUS"
-  log "Color global  : $GLOBAL_COLOR"
   log "Device-groups détectés :"
-  for dg_short in "${!DG_FULL[@]}"; do
+  for dg_short in "${!DG_FULL_MAP[@]}"; do
     printf "  - %-35s : %-24s color=%-8s (%s)\n" \
-      "${DG_FULL[$dg_short]}" \
-      "${DG_STATUS[$dg_short]}" \
-      "$GLOBAL_COLOR" \
-      "${DG_TYPE[$dg_short]}" | tee -a "$LOG_FILE"
+      "${DG_FULL_MAP[$dg_short]}" \
+      "${DG_STATUS_MAP[$dg_short]}" \
+      "$CURRENT_GLOBAL_COLOR" \
+      "${DG_TYPE_MAP[$dg_short]}" | tee -a "$LOG_FILE"
   done
 
-  NEEDS=()
-  for dg_short in "${!DG_FULL[@]}"; do
-    if [[ "${DG_TYPE[$dg_short]}" == "sync-failover" || "${DG_TYPE[$dg_short]}" == "sync-only" ]]; then
-      if [[ "${DG_ACTION[$dg_short]}" == "sync" || "${DG_ACTION[$dg_short]}" == "force" ]]; then
-        NEEDS+=("$dg_short")
-      fi
-    fi
-  done
+  list_needs
 
   if [[ "${#NEEDS[@]}" -eq 0 ]]; then
     log ""
@@ -482,37 +465,62 @@ while IFS= read -r LINE || [[ -n "$LINE" ]]; do
     continue
   fi
 
-  log ""
-  log "⚠️  Device-groups nécessitant une action : ${#NEEDS[@]}"
-  for dg_short in "${NEEDS[@]}"; do
-    log "  * ${DG_FULL[$dg_short]} (${DG_TYPE[$dg_short]}) : status=${DG_STATUS[$dg_short]} color=${GLOBAL_COLOR} action=${DG_ACTION[$dg_short]}"
-  done
-  log ""
-
   if [[ "$ROLE" != "ACTIVE" ]]; then
+    log ""
+    log "⚠️  Nombre de groupes à synchroniser : ${#NEEDS[@]}"
+    idx=0
+    for dg_short in "${NEEDS[@]}"; do
+      idx=$((idx+1))
+      log "  [$idx/${#NEEDS[@]}] ${DG_FULL_MAP[$dg_short]} (${DG_TYPE_MAP[$dg_short]}) : status=${DG_STATUS_MAP[$dg_short]} color=${CURRENT_GLOBAL_COLOR} action=${DG_ACTION_MAP[$dg_short]}"
+    done
     log "ℹ️  Équipement non ACTIVE => aucune demande de synchronisation."
     log ""
     continue
   fi
 
-  for dg_short in "${NEEDS[@]}"; do
-    dg_full="${DG_FULL[$dg_short]}"
-    dg_type="${DG_TYPE[$dg_short]}"
-    st="${DG_STATUS[$dg_short]}"
-    action="${DG_ACTION[$dg_short]}"
+  while true; do
+    build_current_state "$HOST"
+    list_needs
+
+    if [[ "${#NEEDS[@]}" -eq 0 ]]; then
+      log ""
+      log "✅ Plus aucun groupe à synchroniser pour $HOST."
+      log "📌 Bilan global final : status=$CURRENT_GLOBAL_STATUS color=$CURRENT_GLOBAL_COLOR"
+      log ""
+      break
+    fi
+
+    log ""
+    log "⚠️  Groupes restant à synchroniser : ${#NEEDS[@]}"
+    idx=0
+    for dg_short in "${NEEDS[@]}"; do
+      idx=$((idx+1))
+      log "  [$idx/${#NEEDS[@]}] ${DG_FULL_MAP[$dg_short]} (${DG_TYPE_MAP[$dg_short]}) : status=${DG_STATUS_MAP[$dg_short]} color=${CURRENT_GLOBAL_COLOR} action=${DG_ACTION_MAP[$dg_short]}"
+    done
+    log ""
+
+    # On propose toujours le premier groupe restant
+    dg_short="${NEEDS[0]}"
+    dg_full="${DG_FULL_MAP[$dg_short]}"
+    dg_type="${DG_TYPE_MAP[$dg_short]}"
+    st="${DG_STATUS_MAP[$dg_short]}"
+    action="${DG_ACTION_MAP[$dg_short]}"
 
     log "--------------------------------------"
+    log "Prochain groupe proposé"
     log "DG     : $dg_full"
     log "Type   : $dg_type"
     log "Status : $st"
-    log "Color  : $GLOBAL_COLOR"
+    log "Color  : $CURRENT_GLOBAL_COLOR"
     log "Action : $action"
 
-    prompt="$(build_status_prompt "$dg_full" "$dg_type" "$st" "$GLOBAL_COLOR" "$action")"
+    prompt="$(build_status_prompt "$dg_full" "$dg_type" "$st" "$CURRENT_GLOBAL_COLOR" "$action")"
     read -r -p "$prompt" ans </dev/tty || ans="n"
 
     if [[ "${ans,,}" != "y" && "${ans,,}" != "yes" ]]; then
-      log "⏭️  Ignoré."
+      log "⏭️  Groupe ignoré."
+      # On enlève le groupe ignoré de cette itération en le marquant none localement
+      DG_ACTION_MAP["$dg_short"]="none"
       continue
     fi
 
@@ -520,9 +528,11 @@ while IFS= read -r LINE || [[ -n "$LINE" ]]; do
       log "❌ Validation de synchronisation échouée pour $dg_full"
       FAILS=$((FAILS+1))
     fi
-  done
 
-  log ""
+    build_current_state "$HOST"
+    log "🌐 État global après traitement de $dg_full : status=$CURRENT_GLOBAL_STATUS color=$CURRENT_GLOBAL_COLOR"
+    log ""
+  done
 done < "$DEVICES_FILE"
 
 log "======================================"
