@@ -6,7 +6,6 @@ set -euo pipefail
 #######################################
 DEVICES_FILE="devices.txt"
 CURL_OPTS=(-k -sS --connect-timeout 10 --max-time 30)
-
 SYNC_POLL_SLEEP=3
 SYNC_POLL_TIMEOUT=120
 SYNC_RETRY_FORCE_ON_FAILURE=1
@@ -29,7 +28,7 @@ AUTH=(-u "${USER}:${PASS}")
 #######################################
 # PRECHECKS
 #######################################
-for bin in curl jq awk tr grep wc date tee sed mktemp; do
+for bin in curl jq awk tr grep wc date sed mktemp; do
   command -v "$bin" >/dev/null || { echo "❌ $bin requis"; exit 1; }
 done
 [[ -f "$DEVICES_FILE" ]] || { echo "❌ Fichier $DEVICES_FILE introuvable"; exit 1; }
@@ -62,7 +61,7 @@ dump_json() {
 }
 
 trim_line() {
-  printf "%s" "$1" | tr -d '\r' | awk '{$1=$1;print}'
+  printf "%s" "${1:-}" | tr -d '\r' | awk '{$1=$1;print}'
 }
 
 normalize_text() {
@@ -76,7 +75,7 @@ normalize_lower() {
 #######################################
 # REST
 #######################################
-rest_get_or_empty() {
+rest_get() {
   local host="$1" path="$2" out rc
   dbg "GET https://${host}${path}"
   set +e
@@ -125,13 +124,17 @@ rest_post_config_sync() {
 #######################################
 # HA ROLE
 #######################################
-get_failover_role_raw() {
+get_failover_status_json() {
   local host="$1" js
-  js="$(rest_get_or_empty "$host" "/mgmt/tm/cm/failover-status/stats" || true)"
+  js="$(rest_get "$host" "/mgmt/tm/cm/failover-status/stats" || true)"
   dump_json "failover-status/stats (${host})" "$js"
+  echo "$js"
+}
 
+get_failover_role_raw() {
+  local js="$1"
   jq -r '
-    [ .. | strings | select(test("\\bACTIVE\\b|\\bSTANDBY\\b";"i")) ][0] // "UNKNOWN"
+    [ .. | strings | select(test("\\bACTIVE\\b|\\bSTANDBY\\b"; "i")) ][0] // "UNKNOWN"
   ' <<<"$js" 2>/dev/null | head -n 1
 }
 
@@ -148,28 +151,26 @@ normalize_role() {
 }
 
 #######################################
-# DEVICE-GROUPS / STATUS
+# DEVICE GROUPS / SYNC STATUS
 #######################################
-get_all_device_groups_tsv() {
+get_device_groups_json() {
   local host="$1" js
-  js="$(rest_get_or_empty "$host" "/mgmt/tm/cm/device-group?\$select=fullPath,type" || true)"
+  js="$(rest_get "$host" "/mgmt/tm/cm/device-group?\$select=fullPath,type" || true)"
   dump_json "device-group (${host})" "$js"
+  echo "$js"
+}
 
+get_all_device_groups_tsv() {
+  local js="$1"
   jq -r '
     (.items // [])[]
     | [.fullPath, .type] | @tsv
   ' <<<"$js" 2>/dev/null || true
 }
 
-normalize_dg_name() {
-  local dg="${1:-}"
-  dg="${dg##*/}"
-  printf "%s" "$dg"
-}
-
 get_sync_stats_json() {
   local host="$1" js
-  js="$(rest_get_or_empty "$host" "/mgmt/tm/cm/sync-status/stats" || echo "{}")"
+  js="$(rest_get "$host" "/mgmt/tm/cm/sync-status/stats" || true)"
   dump_json "sync-status/stats (${host})" "$js"
   echo "$js"
 }
@@ -179,7 +180,7 @@ get_global_sync_status_from_json() {
   jq -r '
     [ .. | objects | .status? | .description? ]
     | map(select(type=="string" and .!=""))
-    | .[0] // "UNKNOWN"
+    | .[0] // ""
   ' <<<"$js" 2>/dev/null
 }
 
@@ -188,8 +189,14 @@ get_sync_color_from_json() {
   jq -r '
     [ .. | objects | .color? | .description? ]
     | map(select(type=="string" and .!=""))
-    | .[0] // "unknown"
+    | .[0] // ""
   ' <<<"$js" 2>/dev/null
+}
+
+normalize_dg_name() {
+  local dg="${1:-}"
+  dg="${dg##*/}"
+  printf "%s" "$dg"
 }
 
 get_dg_status_from_sync_json() {
@@ -237,11 +244,7 @@ decide_action() {
 }
 
 build_status_prompt() {
-  local dg="$1"
-  local dg_type="$2"
-  local status="$3"
-  local color="$4"
-  local action="$5"
+  local dg="$1" dg_type="$2" status="$3" color="$4" action="$5"
 
   case "$action" in
     force)
@@ -286,10 +289,7 @@ run_force_full_load_push_to_group() {
 # POLLING
 #######################################
 poll_dg_until_in_sync() {
-  local host="$1"
-  local dg_full="$2"
-  local dg_type="$3"
-
+  local host="$1" dg_full="$2" dg_type="$3"
   local start now js dg_status global_status color
 
   start="$(date +%s)"
@@ -303,22 +303,15 @@ poll_dg_until_in_sync() {
     dbg "Polling $dg_full (type=$dg_type) => dg_status='$dg_status' global_status='$global_status' color='$color'"
 
     if [[ "$dg_type" == "sync-failover" ]]; then
-      if [[ "$dg_status" == "In Sync" ]]; then
-        log "✅ $dg_full : In Sync confirmé"
-        return 0
-      fi
+      [[ "$dg_status" == "In Sync" ]] && { log "✅ $dg_full : In Sync confirmé"; return 0; }
     fi
 
     if [[ "$dg_type" == "sync-only" ]]; then
-      if [[ "$dg_status" == "In Sync" ]]; then
-        log "✅ $dg_full : In Sync confirmé"
-        return 0
-      fi
-
-      if [[ "$dg_status" == "UNKNOWN" && "$global_status" != "Changes Pending" ]]; then
+      [[ "$dg_status" == "In Sync" ]] && { log "✅ $dg_full : In Sync confirmé"; return 0; }
+      [[ "$dg_status" == "UNKNOWN" && "$global_status" != "Changes Pending" ]] && {
         log "✅ $dg_full : synchronisation OK (sync-only, plus de Changes Pending global)"
         return 0
-      fi
+      }
     fi
 
     now="$(date +%s)"
@@ -332,10 +325,7 @@ poll_dg_until_in_sync() {
 }
 
 run_action_with_validation() {
-  local host="$1"
-  local dg_full="$2"
-  local dg_type="$3"
-  local action="$4"
+  local host="$1" dg_full="$2" dg_type="$3" action="$4"
 
   if [[ "$action" == "force" ]]; then
     log "🚀 Lancement : force-full-load-push to-group $dg_full"
@@ -366,29 +356,29 @@ run_action_with_validation() {
 #######################################
 # BUILD LISTS
 #######################################
-# Retourne :
-#   CURRENT_GLOBAL_STATUS
-#   CURRENT_GLOBAL_COLOR
-#   ALL_GROUPS_TSV
-#   NEEDS_TSV
 build_current_lists() {
   local host="$1"
-  local js dg_list dg_full dg_type dg_status action
+  local failover_js sync_js dg_js dg_list dg_full dg_type dg_status action
   local all_tmp needs_tmp
 
   all_tmp="$(mktemp)"
   needs_tmp="$(mktemp)"
 
-  js="$(get_sync_stats_json "$host")"
-  CURRENT_GLOBAL_STATUS="$(normalize_text "$(get_global_sync_status_from_json "$js")")"
-  CURRENT_GLOBAL_COLOR="$(normalize_lower "$(get_sync_color_from_json "$js")")"
-  dg_list="$(get_all_device_groups_tsv "$host" || true)"
+  failover_js="$(get_failover_status_json "$host")"
+  sync_js="$(get_sync_stats_json "$host")"
+  dg_js="$(get_device_groups_json "$host")"
+
+  CURRENT_ROLE_RAW="$(get_failover_role_raw "$failover_js")"
+  CURRENT_ROLE="$(normalize_role "$CURRENT_ROLE_RAW")"
+  CURRENT_GLOBAL_STATUS="$(normalize_text "$(get_global_sync_status_from_json "$sync_js")")"
+  CURRENT_GLOBAL_COLOR="$(normalize_lower "$(get_sync_color_from_json "$sync_js")")"
+  dg_list="$(get_all_device_groups_tsv "$dg_js")"
 
   while IFS=$'\t' read -r dg_full dg_type; do
     [[ -z "${dg_full:-}" || -z "${dg_type:-}" ]] && continue
 
     dg_type="$(normalize_text "$dg_type")"
-    dg_status="$(normalize_text "$(get_dg_status_from_sync_json "$dg_full" "$js")")"
+    dg_status="$(normalize_text "$(get_dg_status_from_sync_json "$dg_full" "$sync_js")")"
     action="$(normalize_text "$(decide_action "$dg_status" "$CURRENT_GLOBAL_COLOR")")"
 
     dbg "STATE DG='$dg_full' type='$dg_type' dg_status='$dg_status' global_status='$CURRENT_GLOBAL_STATUS' color='$CURRENT_GLOBAL_COLOR' action='$action'"
@@ -406,7 +396,7 @@ build_current_lists() {
     [[ -z "${dg_full:-}" || -z "${dg_type:-}" ]] && continue
 
     dg_type="$(normalize_text "$dg_type")"
-    dg_status="$(normalize_text "$(get_dg_status_from_sync_json "$dg_full" "$js")")"
+    dg_status="$(normalize_text "$(get_dg_status_from_sync_json "$dg_full" "$sync_js")")"
     action="$(normalize_text "$(decide_action "$dg_status" "$CURRENT_GLOBAL_COLOR")")"
 
     if [[ "$dg_type" == "sync-only" && ( "$action" == "sync" || "$action" == "force" ) ]]; then
@@ -431,7 +421,7 @@ COUNT=0
 FAILS=0
 
 log ""
-log "🔁 HA ConfigSync — version simplifiée et robuste"
+log "🔁 HA ConfigSync — version corrigée"
 log "Règle absolue : synchronisation uniquement depuis l'ACTIVE"
 log "Priorité : sync-failover puis sync-only"
 log "Fallback : sync standard -> force-full-load-push si échec"
@@ -448,24 +438,36 @@ while IFS= read -r LINE || [[ -n "$LINE" ]]; do
   log "➡️  [$COUNT/$TOTAL] BIG-IP : $HOST"
   log "======================================"
 
-  ROLE_RAW="$(get_failover_role_raw "$HOST" || true)"
-  ROLE="$(normalize_role "$ROLE_RAW")"
-
-  log "Role brut : ${ROLE_RAW:-UNKNOWN}"
-  log "Role norm : ${ROLE}"
-
   build_current_lists "$HOST"
 
-  log "Status global : $CURRENT_GLOBAL_STATUS"
-  log "Color global  : $CURRENT_GLOBAL_COLOR"
+  log "Role brut : ${CURRENT_ROLE_RAW:-UNKNOWN}"
+  log "Role norm : ${CURRENT_ROLE:-UNKNOWN}"
+  log "Status global : ${CURRENT_GLOBAL_STATUS:-}"
+  log "Color global  : ${CURRENT_GLOBAL_COLOR:-}"
   log ""
-  log "Device-groups détectés :"
 
+  if [[ "${CURRENT_ROLE:-UNKNOWN}" == "UNKNOWN" ]]; then
+    log "❌ Rôle HA non exploitable via REST pour $HOST"
+    log ""
+    FAILS=$((FAILS+1))
+    continue
+  fi
+
+  if [[ -z "${CURRENT_GLOBAL_STATUS:-}" || -z "${CURRENT_GLOBAL_COLOR:-}" ]]; then
+    log "❌ Sync status non exploitable via REST pour $HOST"
+    log ""
+    FAILS=$((FAILS+1))
+    continue
+  fi
+
+  log "Device-groups détectés :"
   if [[ -n "${ALL_GROUPS_TSV:-}" ]]; then
     while IFS=$'\t' read -r dg_full dg_type dg_status dg_color dg_action; do
       [[ -z "${dg_full:-}" ]] && continue
       log "  - $dg_full : status=$dg_status color=$dg_color type=$dg_type action=$dg_action"
     done <<< "$ALL_GROUPS_TSV"
+  else
+    log "  (aucun device-group retourné)"
   fi
 
   NEEDS_COUNT="$(printf "%s\n" "${NEEDS_TSV:-}" | sed '/^$/d' | wc -l | awk '{print $1}')"
@@ -477,7 +479,7 @@ while IFS= read -r LINE || [[ -n "$LINE" ]]; do
     continue
   fi
 
-  if [[ "$ROLE" != "ACTIVE" ]]; then
+  if [[ "$CURRENT_ROLE" != "ACTIVE" ]]; then
     log ""
     log "⚠️  Nombre de groupes à synchroniser : $NEEDS_COUNT"
     idx=0
@@ -533,7 +535,6 @@ while IFS= read -r LINE || [[ -n "$LINE" ]]; do
 
     if [[ "${ans,,}" != "y" && "${ans,,}" != "yes" ]]; then
       log "⏭️  Groupe ignoré."
-      # on retire juste le premier de l'itération actuelle
       NEEDS_TSV="$(printf "%s\n" "$NEEDS_TSV" | sed '1d')"
       continue
     fi
