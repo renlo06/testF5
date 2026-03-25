@@ -29,7 +29,7 @@ AUTH=(-u "${USER}:${PASS}")
 #######################################
 # PRECHECKS
 #######################################
-for bin in curl jq awk tr grep wc date tee head; do
+for bin in curl jq awk tr grep wc date tee head sed; do
   command -v "$bin" >/dev/null || { echo "❌ $bin requis"; exit 1; }
 done
 [[ -f "$DEVICES_FILE" ]] || { echo "❌ Fichier $DEVICES_FILE introuvable"; exit 1; }
@@ -63,6 +63,10 @@ dump_json() {
 
 trim_line() {
   printf "%s" "$1" | tr -d '\r' | awk '{$1=$1;print}'
+}
+
+normalize_text() {
+  printf "%s" "${1:-}" | tr -d '\r' | sed 's/^[[:space:]]*//; s/[[:space:]]*$//'
 }
 
 #######################################
@@ -128,7 +132,8 @@ get_failover_role_raw() {
 }
 
 normalize_role() {
-  local raw="${1:-}"
+  local raw
+  raw="$(normalize_text "${1:-}")"
   if grep -qi "\bACTIVE\b" <<<"$raw"; then
     echo "ACTIVE"
   elif grep -qi "\bSTANDBY\b" <<<"$raw"; then
@@ -214,8 +219,11 @@ get_dg_status_from_sync_json() {
 # RULES
 #######################################
 decide_action() {
-  local status="$1"
-  local color="$2"
+  local status color
+
+  status="$(normalize_text "${1:-}")"
+  color="$(normalize_text "${2:-}")"
+  color="$(printf "%s" "$color" | tr '[:upper:]' '[:lower:]')"
 
   case "${status}|${color}" in
     "Awaiting Initial Sync|blue")
@@ -305,9 +313,9 @@ poll_dg_until_in_sync() {
 
   while true; do
     js="$(get_sync_stats_json "$host")"
-    dg_status="$(get_dg_status_from_sync_json "$dg_full" "$js")"
-    global_status="$(get_global_sync_status_from_json "$js")"
-    color="$(get_sync_color_from_json "$js")"
+    dg_status="$(normalize_text "$(get_dg_status_from_sync_json "$dg_full" "$js")")"
+    global_status="$(normalize_text "$(get_global_sync_status_from_json "$js")")"
+    color="$(normalize_text "$(get_sync_color_from_json "$js")")"
 
     dbg "Polling $dg_full (type=$dg_type) => dg_status='$dg_status' global_status='$global_status' color='$color'"
 
@@ -379,8 +387,8 @@ build_current_state() {
   local host="$1"
 
   CURRENT_JS="$(get_sync_stats_json "$host")"
-  CURRENT_GLOBAL_COLOR="$(get_sync_color_from_json "$CURRENT_JS")"
-  CURRENT_GLOBAL_STATUS="$(get_global_sync_status_from_json "$CURRENT_JS")"
+  CURRENT_GLOBAL_COLOR="$(normalize_text "$(get_sync_color_from_json "$CURRENT_JS")")"
+  CURRENT_GLOBAL_STATUS="$(normalize_text "$(get_global_sync_status_from_json "$CURRENT_JS")")"
   CURRENT_DG_LIST_TSV="$(get_all_device_groups_tsv "$host" || true)"
 
   declare -gA DG_FULL_MAP=()
@@ -394,7 +402,7 @@ build_current_state() {
 
     DG_FULL_MAP["$dg_short"]="$dg_full"
     DG_TYPE_MAP["$dg_short"]="$dg_type"
-    DG_STATUS_MAP["$dg_short"]="$(get_dg_status_from_sync_json "$dg_full" "$CURRENT_JS")"
+    DG_STATUS_MAP["$dg_short"]="$(normalize_text "$(get_dg_status_from_sync_json "$dg_full" "$CURRENT_JS")")"
     DG_ACTION_MAP["$dg_short"]="$(decide_action "${DG_STATUS_MAP[$dg_short]}" "$CURRENT_GLOBAL_COLOR")"
 
     dbg "STATE DG='$dg_full' type='$dg_type' dg_status='${DG_STATUS_MAP[$dg_short]}' global_status='$CURRENT_GLOBAL_STATUS' color='$CURRENT_GLOBAL_COLOR' action='${DG_ACTION_MAP[$dg_short]}'"
@@ -499,7 +507,6 @@ while IFS= read -r LINE || [[ -n "$LINE" ]]; do
     done
     log ""
 
-    # On propose toujours le premier groupe restant
     dg_short="${NEEDS[0]}"
     dg_full="${DG_FULL_MAP[$dg_short]}"
     dg_type="${DG_TYPE_MAP[$dg_short]}"
@@ -519,7 +526,6 @@ while IFS= read -r LINE || [[ -n "$LINE" ]]; do
 
     if [[ "${ans,,}" != "y" && "${ans,,}" != "yes" ]]; then
       log "⏭️  Groupe ignoré."
-      # On enlève le groupe ignoré de cette itération en le marquant none localement
       DG_ACTION_MAP["$dg_short"]="none"
       continue
     fi
