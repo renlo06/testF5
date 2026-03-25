@@ -4,7 +4,7 @@
 # SCRIPT METADATA
 #######################################
 SCRIPT_NAME="f5-db-update-active-only.sh"
-SCRIPT_VERSION="1.1"
+SCRIPT_VERSION="1.2"
 SCRIPT_DATE="2026-03-25"
 SCRIPT_AUTHOR="ggggg"
 
@@ -119,15 +119,37 @@ DB1_VALUE="$DB1_VALUE"
 DB2_NAME="$DB2_NAME"
 DB2_VALUE="$DB2_VALUE"
 
-ROLE_RAW=\$(tmsh -q -c "show cm failover-status" 2>/dev/null || true)
+echo "----- Détection rôle HA -----"
 
-echo "----- Rôle HA -----"
-echo "\$ROLE_RAW"
+SYS_FAILOVER_RAW=\$(tmsh -q -c "show sys failover" 2>/dev/null || true)
+CM_FAILOVER_RAW=\$(tmsh -q -c "show cm failover-status" 2>/dev/null || true)
+
+echo "[show sys failover]"
+echo "\$SYS_FAILOVER_RAW"
+echo
+echo "[show cm failover-status]"
+echo "\$CM_FAILOVER_RAW"
 echo
 
-if echo "\$ROLE_RAW" | grep -qi "ACTIVE"; then
-  echo "ACTIVE_DETECTED=1"
-  echo "----- Application des commandes -----"
+ROLE="UNKNOWN"
+
+# Priorité à show sys failover
+if echo "\$SYS_FAILOVER_RAW" | grep -Eqi '^[[:space:]]*Failover[[:space:]]+active[[:space:]]*$|^[[:space:]]*Failover[[:space:]]+Active[[:space:]]*$'; then
+  ROLE="ACTIVE"
+elif echo "\$SYS_FAILOVER_RAW" | grep -Eqi '^[[:space:]]*Failover[[:space:]]+standby[[:space:]]*$|^[[:space:]]*Failover[[:space:]]+Standby[[:space:]]*$'; then
+  ROLE="STANDBY"
+# Fallback sur show cm failover-status
+elif echo "\$CM_FAILOVER_RAW" | grep -Eqi '^[[:space:]]*Status[[:space:]]+ACTIVE[[:space:]]*$'; then
+  ROLE="ACTIVE"
+elif echo "\$CM_FAILOVER_RAW" | grep -Eqi '^[[:space:]]*Status[[:space:]]+STANDBY[[:space:]]*$'; then
+  ROLE="STANDBY"
+fi
+
+echo "ROLE_DETECTED=\$ROLE"
+echo
+
+if [[ "\$ROLE" == "ACTIVE" ]]; then
+  echo "----- Application des commandes sur ACTIVE -----"
 
   tmsh modify sys db "\$DB1_NAME" value "\$DB1_VALUE"
   tmsh modify sys db "\$DB2_NAME" value "\$DB2_VALUE"
@@ -141,13 +163,11 @@ if echo "\$ROLE_RAW" | grep -qi "ACTIVE"; then
   echo "RESULT=UPDATED"
   exit 0
 
-elif echo "\$ROLE_RAW" | grep -qi "STANDBY"; then
-  echo "ACTIVE_DETECTED=0"
+elif [[ "\$ROLE" == "STANDBY" ]]; then
   echo "RESULT=SKIPPED_STANDBY"
   exit 10
 
 else
-  echo "ACTIVE_DETECTED=UNKNOWN"
   echo "RESULT=UNKNOWN_ROLE"
   exit 20
 fi
@@ -162,7 +182,7 @@ EOF
     echo "$INFO Équipement STANDBY, aucune modification appliquée"
     SKIPPED=$((SKIPPED+1))
   else
-    echo "$ERR Erreur lors du traitement"
+    echo "$ERR Rôle non déterminé ou erreur lors du traitement"
     FAIL=$((FAIL+1))
   fi
 
