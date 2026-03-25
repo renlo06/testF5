@@ -4,7 +4,7 @@
 # SCRIPT METADATA
 #######################################
 SCRIPT_NAME="f5-db-update-active-only.sh"
-SCRIPT_VERSION="1.4"
+SCRIPT_VERSION="1.5"
 SCRIPT_DATE="2026-03-25"
 SCRIPT_AUTHOR="ggggg"
 
@@ -25,16 +25,12 @@ set -euo pipefail
 # CONFIG
 #######################################
 BIGIP_FILE="devices.txt"
-LOGS_DIR="./logs"
 SSH_TIMEOUT_LONG=20
-TIMESTAMP="$(date +%Y%m%d-%H%M%S)"
 
 OK="✅"
 ERR="❌"
 INFO="ℹ️"
 
-# Commandes demandées
-# Si "fasse" est une coquille, remplace par "false"
 DB1_NAME="tmm.ssl.useffdhe"
 DB1_VALUE="fasse"
 
@@ -44,7 +40,7 @@ DB2_VALUE="enable"
 #######################################
 # PRECHECKS
 #######################################
-for bin in ssh sshpass grep wc awk tr date mkdir; do
+for bin in ssh sshpass awk grep wc tr; do
   command -v "$bin" >/dev/null || { echo "❌ $bin requis"; exit 1; }
 done
 
@@ -60,22 +56,15 @@ echo "======================================"
 echo " $SCRIPT_NAME"
 echo " Version : $SCRIPT_VERSION"
 echo " Date    : $SCRIPT_DATE"
-echo " Auteur  : $SCRIPT_AUTHOR"
 echo "======================================"
-echo
-echo "Paramètres à appliquer :"
-echo " - modify sys db $DB1_NAME value $DB1_VALUE"
-echo " - modify sys db $DB2_NAME value $DB2_VALUE"
 echo
 
 #######################################
 # INPUTS
 #######################################
 read -rp "Utilisateur (sauf root) : " LOGIN
-read -s -rp "Mot de passe du compte $LOGIN : " LOGINPWD
+read -s -rp "Mot de passe : " LOGINPWD
 echo
-
-mkdir -p "${LOGS_DIR}"
 
 #######################################
 # COUNTERS
@@ -83,13 +72,13 @@ mkdir -p "${LOGS_DIR}"
 TOTAL=$(grep -Ev '^\s*#|^\s*$' "$BIGIP_FILE" | wc -l | awk '{print $1}')
 COUNT=0
 SUCCESS=0
-FAIL=0
 SKIPPED=0
+FAIL=0
 
 #######################################
 # MAIN LOOP
 #######################################
-echo "🔧 Début de la mise à jour des DB variables"
+echo "🔧 Début traitement"
 echo
 
 exec 3< "$BIGIP_FILE"
@@ -99,11 +88,9 @@ while IFS= read -r LINE <&3 || [[ -n "${LINE:-}" ]]; do
   [[ -z "$F5_HOST" || "$F5_HOST" =~ ^# ]] && continue
 
   COUNT=$((COUNT+1))
-  LOGFILE="${LOGS_DIR}/${TIMESTAMP}_${F5_HOST}_db_update.log"
 
   echo "======================================"
-  echo "➡️  [$COUNT/$TOTAL] BIG-IP : $F5_HOST"
-  echo "📝 Log : $LOGFILE"
+  echo "➡️  [$COUNT/$TOTAL] $F5_HOST"
   echo "======================================"
 
   set +e
@@ -112,16 +99,10 @@ while IFS= read -r LINE <&3 || [[ -n "${LINE:-}" ]]; do
     -o StrictHostKeyChecking=no \
     -o ConnectTimeout="$SSH_TIMEOUT_LONG" \
     -o LogLevel=ERROR \
-    "$LOGIN@$F5_HOST" 'bash -s' >"$LOGFILE" 2>&1 <<EOF
-DB1_NAME="$DB1_NAME"
-DB1_VALUE="$DB1_VALUE"
-DB2_NAME="$DB2_NAME"
-DB2_VALUE="$DB2_VALUE"
-
+    "$LOGIN@$F5_HOST" 'bash -s' <<EOF
 echo "===== CHECK ROLE ====="
 
 ROLE_RAW=\$(tmsh -q -c "show cm failover-status" 2>/dev/null || true)
-
 echo "\$ROLE_RAW"
 echo
 
@@ -133,48 +114,46 @@ ROLE=\$(printf "%s\n" "\$ROLE_RAW" | awk '
   }
 ')
 
-if [[ -z "\$ROLE" ]]; then
-  ROLE="UNKNOWN"
-fi
+[[ -z "\$ROLE" ]] && ROLE="UNKNOWN"
 
 echo "ROLE=\$ROLE"
 echo
 
 if [[ "\$ROLE" == "ACTIVE" ]]; then
-  echo "=== APPLY CHANGES (ACTIVE) ==="
+  echo "=== APPLY CHANGES ==="
 
-  tmsh modify sys db "\$DB1_NAME" value "\$DB1_VALUE"
-  tmsh modify sys db "\$DB2_NAME" value "\$DB2_VALUE"
+  tmsh modify sys db "$DB1_NAME" value "$DB1_VALUE"
+  tmsh modify sys db "$DB2_NAME" value "$DB2_VALUE"
 
   echo
   echo "=== VERIFY ==="
-  tmsh list sys db "\$DB1_NAME"
-  tmsh list sys db "\$DB2_NAME"
+  tmsh list sys db "$DB1_NAME"
+  tmsh list sys db "$DB2_NAME"
 
-  echo
   echo "RESULT=UPDATED"
   exit 0
 
 elif [[ "\$ROLE" == "STANDBY" ]]; then
-  echo "RESULT=SKIPPED_STANDBY"
+  echo "RESULT=SKIPPED"
   exit 10
 
 else
-  echo "RESULT=UNKNOWN_ROLE"
+  echo "RESULT=UNKNOWN"
   exit 20
 fi
 EOF
+
   RET=$?
   set -e
 
   if [[ $RET -eq 0 ]]; then
-    echo "$OK Mise à jour effectuée sur l'ACTIVE"
+    echo "$OK ACTIVE traité"
     SUCCESS=$((SUCCESS+1))
   elif [[ $RET -eq 10 ]]; then
-    echo "$INFO Équipement STANDBY, aucune modification appliquée"
+    echo "$INFO STANDBY ignoré"
     SKIPPED=$((SKIPPED+1))
   else
-    echo "$ERR Rôle non déterminé ou erreur lors du traitement"
+    echo "$ERR Erreur"
     FAIL=$((FAIL+1))
   fi
 
@@ -184,13 +163,12 @@ done
 exec 3<&-
 
 #######################################
-# FINAL SUMMARY
+# SUMMARY
 #######################################
 echo "======================================"
-echo "🏁 Terminé"
-echo "Équipements traités : $COUNT"
-echo "Mises à jour OK     : $SUCCESS"
-echo "Ignorés (STANDBY)   : $SKIPPED"
-echo "Erreurs             : $FAIL"
-echo "Logs                : ${LOGS_DIR}"
+echo "🏁 Résumé"
+echo "Total     : $COUNT"
+echo "OK        : $SUCCESS"
+echo "Standby   : $SKIPPED"
+echo "Erreur    : $FAIL"
 echo "======================================"
