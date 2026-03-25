@@ -1,48 +1,110 @@
 #!/usr/bin/env bash
+
+#######################################
+# SCRIPT METADATA
+#######################################
+SCRIPT_NAME="f5-check.sh"
+SCRIPT_VERSION="1.0"
+SCRIPT_DATE="2026-03-06"
+SCRIPT_AUTHOR="ggggg"
+
+#######################################
+# VERSION OPTION
+#######################################
+if [[ "${1:-}" == "-v" || "${1:-}" == "--version" ]]; then
+  echo "$SCRIPT_NAME version $SCRIPT_VERSION ($SCRIPT_DATE)"
+  exit 0
+fi
+
+#######################################
+# BASH SAFETY
+#######################################
 set -euo pipefail
 
 #######################################
 # CONFIG
 #######################################
-DEVICES_FILE="devices.txt"          # 1 host par ligne
-BASE_DIR="./checks"
-TS=$(date +%Y%m%d-%H%M%S)
+BIGIP_FILE="devices.txt"
+LOGS_DIR="./logs"
+SSH_TIMEOUT_LONG=20
+TIMESTAMP="$(date +%Y%m%d-%H%M%S)"
+
+OK="✅"
+ERR="❌"
 
 #######################################
 # PRECHECKS
 #######################################
-for bin in ssh sshpass awk sed sort date mkdir wc tr; do
+for bin in ssh sshpass expect grep wc awk tr date mkdir; do
   command -v "$bin" >/dev/null || { echo "❌ $bin requis"; exit 1; }
 done
 
-[[ -f "$DEVICES_FILE" ]] || { echo "❌ Fichier équipements introuvable : $DEVICES_FILE"; exit 1; }
+[[ -f "$BIGIP_FILE" ]] || {
+  echo "❌ Fichier $BIGIP_FILE introuvable"
+  exit 1
+}
 
-read -p "Saisir le login (sauf root) : " LOGIN
-read -sp "Saisir le mot de passe du compte $LOGIN : " LOGINPWD
-echo ""
-read -p "Saisir l'étape (before ou after) : " PHASE
+#######################################
+# HEADER
+#######################################
+echo "======================================"
+echo " $SCRIPT_NAME"
+echo " Version : $SCRIPT_VERSION"
+echo " Date    : $SCRIPT_DATE"
+echo " Auteur  : $SCRIPT_AUTHOR"
+echo "======================================"
+echo
+
+#######################################
+# INPUTS
+#######################################
+read -rp "Utilisateur (sauf root) : " LOGIN
+read -s -rp "Mot de passe du compte $LOGIN : " LOGINPWD
+echo
+read -rp "Saisir l'étape (before ou after) : " PHASE
 PHASE="${PHASE,,}"
-echo ""
+echo
 
-while IFS= read -r HOST || [[ -n "$HOST" ]]; do
-    [[ -z "$HOST" || "$HOST" =~ ^# ]] && continue
+[[ "$PHASE" == "before" || "$PHASE" == "after" ]] || {
+  echo "❌ La phase doit être 'before' ou 'after'"
+  exit 1
+}
 
-    HOST="${HOST//$'\r'/}"
+mkdir -p "${LOGS_DIR}/${PHASE}"
 
-    echo ""
-    echo "=============================================================="
-    echo "Checks sur $HOST"
-    echo "=============================================================="
+#######################################
+# COUNTERS
+#######################################
+TOTAL=$(grep -Ev '^\s*#|^\s*$' "$BIGIP_FILE" | wc -l | awk '{print $1}')
+COUNT=0
+SUCCESS=0
+FAIL=0
 
-    LOGFILE="${BASE_DIR}/${PHASE}/${TIMESTAMP}_${HOST}_state_${PHASE}.log"
-    ((h++))
+#######################################
+# MAIN LOOP
+#######################################
+echo "🔎 Début des checks"
+echo
 
-    sshpass -p "$LOGINPWD" ssh \
-        -o StrictHostKeyChecking=no \
-        -o ConnectTimeout="$SSH_TIMEOUT_LONG" \
-        -o LogLevel=ERROR \
-        "$LOGIN@$HOST" <<'EOF' > "$LOGFILE" 2>&1
+while IFS= read -r LINE || [[ -n "$LINE" ]]; do
+  F5_HOST="$(printf "%s" "$LINE" | tr -d '\r' | awk '{$1=$1;print}')"
+  [[ -z "$F5_HOST" || "$F5_HOST" =~ ^# ]] && continue
 
+  COUNT=$((COUNT+1))
+  LOGFILE="${LOGS_DIR}/${PHASE}/${TIMESTAMP}_${F5_HOST}_state_${PHASE}.log"
+
+  echo "======================================"
+  echo "➡️  [$COUNT/$TOTAL] BIG-IP : $F5_HOST"
+  echo "📝 Log : $LOGFILE"
+  echo "======================================"
+
+  set +e
+  sshpass -p "$LOGINPWD" ssh \
+    -tt \
+    -o StrictHostKeyChecking=no \
+    -o ConnectTimeout="$SSH_TIMEOUT_LONG" \
+    -o LogLevel=ERROR \
+    "$LOGIN@$F5_HOST" >"$LOGFILE" 2>&1 <<'EOF'
 bash
 
 # ARP
@@ -160,15 +222,27 @@ unset _LTM_NODE
 
 exit
 EOF
+  RET=$?
+  set -e
 
-    RET=$?
+  if [[ $RET -eq 0 ]]; then
+    echo "$OK Vérification effectuée"
+    SUCCESS=$((SUCCESS+1))
+  else
+    echo "$ERR Vérification en erreur"
+    FAIL=$((FAIL+1))
+  fi
 
-    if [[ $RET -eq 0 ]]; then
-        echo -e "Vérification effectuée $OK"
-        ((o++))
-    else
-        echo -e "Vérification en erreur $ERR"
-        ((k++))
-    fi
+  echo
+done < "$BIGIP_FILE"
 
-done < "$DEVICES_FILE"
+#######################################
+# FINAL SUMMARY
+#######################################
+echo "======================================"
+echo "🏁 Terminé"
+echo "Équipements traités : $COUNT"
+echo "Succès              : $SUCCESS"
+echo "Erreurs             : $FAIL"
+echo "Logs                : ${LOGS_DIR}/${PHASE}"
+echo "======================================"
