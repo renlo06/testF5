@@ -29,7 +29,7 @@ AUTH=(-u "${USER}:${PASS}")
 #######################################
 # PRECHECKS
 #######################################
-for bin in curl jq awk tr grep wc date tee head sed sort; do
+for bin in curl jq awk tr grep wc date tee sed mktemp; do
   command -v "$bin" >/dev/null || { echo "❌ $bin requis"; exit 1; }
 done
 [[ -f "$DEVICES_FILE" ]] || { echo "❌ Fichier $DEVICES_FILE introuvable"; exit 1; }
@@ -46,7 +46,7 @@ log() {
 dbg() {
   (( DEBUG == 1 )) || return 0
   local msg="[DEBUG] $*"
-  echo "$msg" >&2
+  echo "$msg"
   echo "$msg" >> "$LOG_FILE"
 }
 
@@ -148,7 +148,7 @@ normalize_role() {
 }
 
 #######################################
-# DEVICE-GROUPS
+# DEVICE-GROUPS / STATUS
 #######################################
 get_all_device_groups_tsv() {
   local host="$1" js
@@ -167,9 +167,6 @@ normalize_dg_name() {
   printf "%s" "$dg"
 }
 
-#######################################
-# SYNC STATUS / COLOR
-#######################################
 get_sync_stats_json() {
   local host="$1" js
   js="$(rest_get_or_empty "$host" "/mgmt/tm/cm/sync-status/stats" || echo "{}")"
@@ -224,35 +221,18 @@ get_dg_status_from_sync_json() {
 #######################################
 decide_action() {
   local status color
-
   status="$(normalize_text "${1:-}")"
   color="$(normalize_lower "${2:-}")"
 
   case "${status}|${color}" in
-    "Awaiting Initial Sync|blue")
-      echo "sync"
-      ;;
-    "Changes Pending|yellow")
-      echo "force"
-      ;;
-    "Changes Pending|red")
-      echo "force"
-      ;;
-    "Not All Devices Synced|yellow")
-      echo "sync"
-      ;;
-    "Not All Devices Synced|red")
-      echo "force"
-      ;;
-    "Syncing|green")
-      echo "none"
-      ;;
-    "In Sync|"*)
-      echo "none"
-      ;;
-    *)
-      echo "none"
-      ;;
+    "Awaiting Initial Sync|blue") echo "sync" ;;
+    "Changes Pending|yellow") echo "force" ;;
+    "Changes Pending|red") echo "force" ;;
+    "Not All Devices Synced|yellow") echo "sync" ;;
+    "Not All Devices Synced|red") echo "force" ;;
+    "Syncing|green") echo "none" ;;
+    "In Sync|"*) echo "none" ;;
+    *) echo "none" ;;
   esac
 }
 
@@ -384,63 +364,63 @@ run_action_with_validation() {
 }
 
 #######################################
-# BUILD CURRENT STATE
+# BUILD LISTS
 #######################################
-build_current_state() {
+# Retourne :
+#   CURRENT_GLOBAL_STATUS
+#   CURRENT_GLOBAL_COLOR
+#   ALL_GROUPS_TSV
+#   NEEDS_TSV
+build_current_lists() {
   local host="$1"
+  local js dg_list dg_full dg_type dg_status action
+  local all_tmp needs_tmp
 
-  CURRENT_JS="$(get_sync_stats_json "$host")"
-  CURRENT_GLOBAL_COLOR="$(normalize_lower "$(get_sync_color_from_json "$CURRENT_JS")")"
-  CURRENT_GLOBAL_STATUS="$(normalize_text "$(get_global_sync_status_from_json "$CURRENT_JS")")"
-  CURRENT_DG_LIST_TSV="$(get_all_device_groups_tsv "$host" || true)"
+  all_tmp="$(mktemp)"
+  needs_tmp="$(mktemp)"
 
-  declare -gA DG_FULL_MAP=()
-  declare -gA DG_TYPE_MAP=()
-  declare -gA DG_STATUS_MAP=()
-  declare -gA DG_ACTION_MAP=()
+  js="$(get_sync_stats_json "$host")"
+  CURRENT_GLOBAL_STATUS="$(normalize_text "$(get_global_sync_status_from_json "$js")")"
+  CURRENT_GLOBAL_COLOR="$(normalize_lower "$(get_sync_color_from_json "$js")")"
+  dg_list="$(get_all_device_groups_tsv "$host" || true)"
 
   while IFS=$'\t' read -r dg_full dg_type; do
     [[ -z "${dg_full:-}" || -z "${dg_type:-}" ]] && continue
-    dg_short="$(normalize_dg_name "$dg_full")"
 
-    DG_FULL_MAP["$dg_short"]="$dg_full"
-    DG_TYPE_MAP["$dg_short"]="$(normalize_text "$dg_type")"
-    DG_STATUS_MAP["$dg_short"]="$(normalize_text "$(get_dg_status_from_sync_json "$dg_full" "$CURRENT_JS")")"
-    DG_ACTION_MAP["$dg_short"]="$(normalize_text "$(decide_action "${DG_STATUS_MAP[$dg_short]}" "$CURRENT_GLOBAL_COLOR")")"
+    dg_type="$(normalize_text "$dg_type")"
+    dg_status="$(normalize_text "$(get_dg_status_from_sync_json "$dg_full" "$js")")"
+    action="$(normalize_text "$(decide_action "$dg_status" "$CURRENT_GLOBAL_COLOR")")"
 
-    dbg "STATE DG='$dg_full' type='${DG_TYPE_MAP[$dg_short]}' dg_status='${DG_STATUS_MAP[$dg_short]}' global_status='$CURRENT_GLOBAL_STATUS' color='$CURRENT_GLOBAL_COLOR' action='${DG_ACTION_MAP[$dg_short]}'"
-  done <<< "$CURRENT_DG_LIST_TSV"
-}
+    dbg "STATE DG='$dg_full' type='$dg_type' dg_status='$dg_status' global_status='$CURRENT_GLOBAL_STATUS' color='$CURRENT_GLOBAL_COLOR' action='$action'"
 
-list_needs() {
-  declare -ga NEEDS=()
-  local dg_short dg_type dg_action
+    printf "%s\t%s\t%s\t%s\t%s\n" \
+      "$dg_full" "$dg_type" "$dg_status" "$CURRENT_GLOBAL_COLOR" "$action" >> "$all_tmp"
 
-  # 1) priorité sync-failover
-  for dg_short in "${!DG_FULL_MAP[@]}"; do
-    dg_type="$(normalize_text "${DG_TYPE_MAP[$dg_short]:-}")"
-    dg_action="$(normalize_text "${DG_ACTION_MAP[$dg_short]:-}")"
-
-    dbg "LIST_NEEDS pass1 dg='${DG_FULL_MAP[$dg_short]}' type='$dg_type' action='$dg_action'"
-
-    if [[ "$dg_type" == "sync-failover" && ( "$dg_action" == "sync" || "$dg_action" == "force" ) ]]; then
-      NEEDS+=("$dg_short")
+    if [[ "$dg_type" == "sync-failover" && ( "$action" == "sync" || "$action" == "force" ) ]]; then
+      printf "%s\t%s\t%s\t%s\t%s\n" \
+        "$dg_full" "$dg_type" "$dg_status" "$CURRENT_GLOBAL_COLOR" "$action" >> "$needs_tmp"
     fi
-  done
+  done <<< "$dg_list"
 
-  # 2) puis sync-only
-  for dg_short in "${!DG_FULL_MAP[@]}"; do
-    dg_type="$(normalize_text "${DG_TYPE_MAP[$dg_short]:-}")"
-    dg_action="$(normalize_text "${DG_ACTION_MAP[$dg_short]:-}")"
+  while IFS=$'\t' read -r dg_full dg_type; do
+    [[ -z "${dg_full:-}" || -z "${dg_type:-}" ]] && continue
 
-    dbg "LIST_NEEDS pass2 dg='${DG_FULL_MAP[$dg_short]}' type='$dg_type' action='$dg_action'"
+    dg_type="$(normalize_text "$dg_type")"
+    dg_status="$(normalize_text "$(get_dg_status_from_sync_json "$dg_full" "$js")")"
+    action="$(normalize_text "$(decide_action "$dg_status" "$CURRENT_GLOBAL_COLOR")")"
 
-    if [[ "$dg_type" == "sync-only" && ( "$dg_action" == "sync" || "$dg_action" == "force" ) ]]; then
-      NEEDS+=("$dg_short")
+    if [[ "$dg_type" == "sync-only" && ( "$action" == "sync" || "$action" == "force" ) ]]; then
+      printf "%s\t%s\t%s\t%s\t%s\n" \
+        "$dg_full" "$dg_type" "$dg_status" "$CURRENT_GLOBAL_COLOR" "$action" >> "$needs_tmp"
     fi
-  done
+  done <<< "$dg_list"
 
-  dbg "LIST_NEEDS result_count=${#NEEDS[@]}"
+  ALL_GROUPS_TSV="$(cat "$all_tmp")"
+  NEEDS_TSV="$(cat "$needs_tmp")"
+
+  dbg "LIST_NEEDS result_count=$(printf "%s\n" "$NEEDS_TSV" | sed '/^$/d' | wc -l | awk '{print $1}')"
+
+  rm -f "$all_tmp" "$needs_tmp"
 }
 
 #######################################
@@ -451,8 +431,8 @@ COUNT=0
 FAILS=0
 
 log ""
-log "🔁 HA ConfigSync — recalcul dynamique des groupes"
-log "Règle absolue : toute demande de synchronisation se fait uniquement depuis l'ACTIVE"
+log "🔁 HA ConfigSync — version simplifiée et robuste"
+log "Règle absolue : synchronisation uniquement depuis l'ACTIVE"
 log "Priorité : sync-failover puis sync-only"
 log "Fallback : sync standard -> force-full-load-push si échec"
 log "Debug : $([[ $DEBUG -eq 1 ]] && echo ON || echo OFF)"
@@ -474,24 +454,23 @@ while IFS= read -r LINE || [[ -n "$LINE" ]]; do
   log "Role brut : ${ROLE_RAW:-UNKNOWN}"
   log "Role norm : ${ROLE}"
 
-  build_current_state "$HOST"
+  build_current_lists "$HOST"
 
   log "Status global : $CURRENT_GLOBAL_STATUS"
   log "Color global  : $CURRENT_GLOBAL_COLOR"
   log ""
   log "Device-groups détectés :"
-  for dg_short in "${!DG_FULL_MAP[@]}"; do
-    printf "  - %-35s : %-24s color=%-8s type=%s action=%s\n" \
-      "${DG_FULL_MAP[$dg_short]}" \
-      "${DG_STATUS_MAP[$dg_short]}" \
-      "$CURRENT_GLOBAL_COLOR" \
-      "${DG_TYPE_MAP[$dg_short]}" \
-      "${DG_ACTION_MAP[$dg_short]}" | tee -a "$LOG_FILE"
-  done
 
-  list_needs
+  if [[ -n "${ALL_GROUPS_TSV:-}" ]]; then
+    while IFS=$'\t' read -r dg_full dg_type dg_status dg_color dg_action; do
+      [[ -z "${dg_full:-}" ]] && continue
+      log "  - $dg_full : status=$dg_status color=$dg_color type=$dg_type action=$dg_action"
+    done <<< "$ALL_GROUPS_TSV"
+  fi
 
-  if [[ "${#NEEDS[@]}" -eq 0 ]]; then
+  NEEDS_COUNT="$(printf "%s\n" "${NEEDS_TSV:-}" | sed '/^$/d' | wc -l | awk '{print $1}')"
+
+  if [[ "$NEEDS_COUNT" -eq 0 ]]; then
     log ""
     log "✅ Aucun device-group ne nécessite d'action selon les règles."
     log ""
@@ -500,22 +479,23 @@ while IFS= read -r LINE || [[ -n "$LINE" ]]; do
 
   if [[ "$ROLE" != "ACTIVE" ]]; then
     log ""
-    log "⚠️  Nombre de groupes à synchroniser : ${#NEEDS[@]}"
+    log "⚠️  Nombre de groupes à synchroniser : $NEEDS_COUNT"
     idx=0
-    for dg_short in "${NEEDS[@]}"; do
+    while IFS=$'\t' read -r dg_full dg_type dg_status dg_color dg_action; do
+      [[ -z "${dg_full:-}" ]] && continue
       idx=$((idx+1))
-      log "  [$idx/${#NEEDS[@]}] ${DG_FULL_MAP[$dg_short]} (${DG_TYPE_MAP[$dg_short]}) : status=${DG_STATUS_MAP[$dg_short]} color=${CURRENT_GLOBAL_COLOR} action=${DG_ACTION_MAP[$dg_short]}"
-    done
+      log "  [$idx/$NEEDS_COUNT] $dg_full ($dg_type) : status=$dg_status color=$dg_color action=$dg_action"
+    done <<< "$NEEDS_TSV"
     log "ℹ️  Équipement non ACTIVE => aucune demande de synchronisation."
     log ""
     continue
   fi
 
   while true; do
-    build_current_state "$HOST"
-    list_needs
+    build_current_lists "$HOST"
+    NEEDS_COUNT="$(printf "%s\n" "${NEEDS_TSV:-}" | sed '/^$/d' | wc -l | awk '{print $1}')"
 
-    if [[ "${#NEEDS[@]}" -eq 0 ]]; then
+    if [[ "$NEEDS_COUNT" -eq 0 ]]; then
       log ""
       log "✅ Plus aucun groupe à synchroniser pour $HOST."
       log "📌 Bilan global final : status=$CURRENT_GLOBAL_STATUS color=$CURRENT_GLOBAL_COLOR"
@@ -524,43 +504,46 @@ while IFS= read -r LINE || [[ -n "$LINE" ]]; do
     fi
 
     log ""
-    log "⚠️  Groupes restant à synchroniser : ${#NEEDS[@]}"
+    log "⚠️  Groupes restant à synchroniser : $NEEDS_COUNT"
     idx=0
-    for dg_short in "${NEEDS[@]}"; do
+    while IFS=$'\t' read -r dg_full dg_type dg_status dg_color dg_action; do
+      [[ -z "${dg_full:-}" ]] && continue
       idx=$((idx+1))
-      log "  [$idx/${#NEEDS[@]}] ${DG_FULL_MAP[$dg_short]} (${DG_TYPE_MAP[$dg_short]}) : status=${DG_STATUS_MAP[$dg_short]} color=${CURRENT_GLOBAL_COLOR} action=${DG_ACTION_MAP[$dg_short]}"
-    done
+      log "  [$idx/$NEEDS_COUNT] $dg_full ($dg_type) : status=$dg_status color=$dg_color action=$dg_action"
+    done <<< "$NEEDS_TSV"
     log ""
 
-    dg_short="${NEEDS[0]}"
-    dg_full="${DG_FULL_MAP[$dg_short]}"
-    dg_type="${DG_TYPE_MAP[$dg_short]}"
-    st="${DG_STATUS_MAP[$dg_short]}"
-    action="${DG_ACTION_MAP[$dg_short]}"
+    FIRST_LINE="$(printf "%s\n" "$NEEDS_TSV" | sed -n '1p')"
+    dg_full="$(printf "%s" "$FIRST_LINE" | awk -F'\t' '{print $1}')"
+    dg_type="$(printf "%s" "$FIRST_LINE" | awk -F'\t' '{print $2}')"
+    dg_status="$(printf "%s" "$FIRST_LINE" | awk -F'\t' '{print $3}')"
+    dg_color="$(printf "%s" "$FIRST_LINE" | awk -F'\t' '{print $4}')"
+    dg_action="$(printf "%s" "$FIRST_LINE" | awk -F'\t' '{print $5}')"
 
     log "--------------------------------------"
     log "Prochain groupe proposé"
     log "DG     : $dg_full"
     log "Type   : $dg_type"
-    log "Status : $st"
-    log "Color  : $CURRENT_GLOBAL_COLOR"
-    log "Action : $action"
+    log "Status : $dg_status"
+    log "Color  : $dg_color"
+    log "Action : $dg_action"
 
-    prompt="$(build_status_prompt "$dg_full" "$dg_type" "$st" "$CURRENT_GLOBAL_COLOR" "$action")"
+    prompt="$(build_status_prompt "$dg_full" "$dg_type" "$dg_status" "$dg_color" "$dg_action")"
     read -r -p "$prompt" ans </dev/tty || ans="n"
 
     if [[ "${ans,,}" != "y" && "${ans,,}" != "yes" ]]; then
       log "⏭️  Groupe ignoré."
-      DG_ACTION_MAP["$dg_short"]="none"
+      # on retire juste le premier de l'itération actuelle
+      NEEDS_TSV="$(printf "%s\n" "$NEEDS_TSV" | sed '1d')"
       continue
     fi
 
-    if ! run_action_with_validation "$HOST" "$dg_full" "$dg_type" "$action"; then
+    if ! run_action_with_validation "$HOST" "$dg_full" "$dg_type" "$dg_action"; then
       log "❌ Validation de synchronisation échouée pour $dg_full"
       FAILS=$((FAILS+1))
     fi
 
-    build_current_state "$HOST"
+    build_current_lists "$HOST"
     log "🌐 État global après traitement de $dg_full : status=$CURRENT_GLOBAL_STATUS color=$CURRENT_GLOBAL_COLOR"
     log ""
   done
