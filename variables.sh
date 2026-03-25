@@ -4,7 +4,7 @@
 # SCRIPT METADATA
 #######################################
 SCRIPT_NAME="f5-db-update-active-only.sh"
-SCRIPT_VERSION="1.2"
+SCRIPT_VERSION="1.3"
 SCRIPT_DATE="2026-03-25"
 SCRIPT_AUTHOR="ggggg"
 
@@ -119,31 +119,50 @@ DB1_VALUE="$DB1_VALUE"
 DB2_NAME="$DB2_NAME"
 DB2_VALUE="$DB2_VALUE"
 
-echo "----- Détection rôle HA -----"
+detect_role() {
+  local sys_raw cm_raw role
 
-SYS_FAILOVER_RAW=\$(tmsh -q -c "show sys failover" 2>/dev/null || true)
-CM_FAILOVER_RAW=\$(tmsh -q -c "show cm failover-status" 2>/dev/null || true)
+  sys_raw=\$(tmsh -q -c "show sys failover" 2>/dev/null || true)
+  cm_raw=\$(tmsh -q -c "show cm failover-status" 2>/dev/null || true)
 
-echo "[show sys failover]"
-echo "\$SYS_FAILOVER_RAW"
-echo
-echo "[show cm failover-status]"
-echo "\$CM_FAILOVER_RAW"
-echo
+  echo "----- Détection rôle HA -----"
+  echo "[show sys failover]"
+  echo "\$sys_raw"
+  echo
+  echo "[show cm failover-status]"
+  echo "\$cm_raw"
+  echo
 
-ROLE="UNKNOWN"
+  role=\$(printf "%s\n" "\$sys_raw" | awk '
+    BEGIN { IGNORECASE=1 }
+    \$1 == "Failover" && \$2 == "active"  { print "ACTIVE";  found=1; exit }
+    \$1 == "Failover" && \$2 == "standby" { print "STANDBY"; found=1; exit }
+    END { if (!found) print "" }
+  ')
 
-# Priorité à show sys failover
-if echo "\$SYS_FAILOVER_RAW" | grep -Eqi '^[[:space:]]*Failover[[:space:]]+active[[:space:]]*$|^[[:space:]]*Failover[[:space:]]+Active[[:space:]]*$'; then
-  ROLE="ACTIVE"
-elif echo "\$SYS_FAILOVER_RAW" | grep -Eqi '^[[:space:]]*Failover[[:space:]]+standby[[:space:]]*$|^[[:space:]]*Failover[[:space:]]+Standby[[:space:]]*$'; then
-  ROLE="STANDBY"
-# Fallback sur show cm failover-status
-elif echo "\$CM_FAILOVER_RAW" | grep -Eqi '^[[:space:]]*Status[[:space:]]+ACTIVE[[:space:]]*$'; then
-  ROLE="ACTIVE"
-elif echo "\$CM_FAILOVER_RAW" | grep -Eqi '^[[:space:]]*Status[[:space:]]+STANDBY[[:space:]]*$'; then
-  ROLE="STANDBY"
-fi
+  if [[ -n "\$role" ]]; then
+    printf "%s" "\$role"
+    return 0
+  fi
+
+  role=\$(printf "%s\n" "\$cm_raw" | awk '
+    BEGIN { IGNORECASE=1 }
+    \$1 == "Status" && \$2 == "ACTIVE"  { print "ACTIVE";  found=1; exit }
+    \$1 == "Status" && \$2 == "STANDBY" { print "STANDBY"; found=1; exit }
+    END { if (!found) print "" }
+  ')
+
+  if [[ -n "\$role" ]]; then
+    printf "%s" "\$role"
+    return 0
+  fi
+
+  printf "%s" "UNKNOWN"
+  return 1
+}
+
+ROLE=\$(detect_role)
+ROLE_RC=\$?
 
 echo "ROLE_DETECTED=\$ROLE"
 echo
