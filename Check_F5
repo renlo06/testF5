@@ -4,7 +4,7 @@
 # SCRIPT METADATA
 #######################################
 SCRIPT_NAME="f5-check.sh"
-SCRIPT_VERSION="1.0"
+SCRIPT_VERSION="1.1"
 SCRIPT_DATE="2026-03-06"
 SCRIPT_AUTHOR="ggggg"
 
@@ -35,7 +35,7 @@ ERR="❌"
 #######################################
 # PRECHECKS
 #######################################
-for bin in ssh sshpass expect grep wc awk tr date mkdir; do
+for bin in ssh sshpass grep wc awk tr date mkdir; do
   command -v "$bin" >/dev/null || { echo "❌ $bin requis"; exit 1; }
 done
 
@@ -86,8 +86,10 @@ FAIL=0
 echo "🔎 Début des checks"
 echo
 
-while IFS= read -r LINE || [[ -n "$LINE" ]]; do
-  F5_HOST="$(printf "%s" "$LINE" | tr -d '\r' | awk '{$1=$1;print}')"
+exec 3< "$BIGIP_FILE"
+
+while IFS= read -r LINE <&3 || [[ -n "${LINE:-}" ]]; do
+  F5_HOST="$(printf "%s" "${LINE:-}" | tr -d '\r' | awk '{$1=$1;print}')"
   [[ -z "$F5_HOST" || "$F5_HOST" =~ ^# ]] && continue
 
   COUNT=$((COUNT+1))
@@ -100,13 +102,11 @@ while IFS= read -r LINE || [[ -n "$LINE" ]]; do
 
   set +e
   sshpass -p "$LOGINPWD" ssh \
-    -tt \
+    -T \
     -o StrictHostKeyChecking=no \
     -o ConnectTimeout="$SSH_TIMEOUT_LONG" \
     -o LogLevel=ERROR \
-    "$LOGIN@$F5_HOST" >"$LOGFILE" 2>&1 <<'EOF'
-bash
-
+    "$LOGIN@$F5_HOST" 'bash -s' >"$LOGFILE" 2>&1 <<'EOF'
 # ARP
 echo
 echo
@@ -219,8 +219,6 @@ echo "===== END SUMMARY ====="
 unset _LTM_VS
 unset _LTM_POOL
 unset _LTM_NODE
-
-exit
 EOF
   RET=$?
   set -e
@@ -234,7 +232,9 @@ EOF
   fi
 
   echo
-done < "$BIGIP_FILE"
+done
+
+exec 3<&-
 
 #######################################
 # FINAL SUMMARY
