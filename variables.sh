@@ -4,7 +4,7 @@
 # SCRIPT METADATA
 #######################################
 SCRIPT_NAME="f5-db-update-active-only.sh"
-SCRIPT_VERSION="1.5"
+SCRIPT_VERSION="1.6"
 SCRIPT_DATE="2026-03-25"
 SCRIPT_AUTHOR="ggggg"
 
@@ -100,11 +100,7 @@ while IFS= read -r LINE <&3 || [[ -n "${LINE:-}" ]]; do
     -o ConnectTimeout="$SSH_TIMEOUT_LONG" \
     -o LogLevel=ERROR \
     "$LOGIN@$F5_HOST" 'bash -s' <<EOF
-echo "===== CHECK ROLE ====="
-
 ROLE_RAW=\$(tmsh -q -c "show cm failover-status" 2>/dev/null || true)
-echo "\$ROLE_RAW"
-echo
 
 ROLE=\$(printf "%s\n" "\$ROLE_RAW" | awk '
   BEGIN { IGNORECASE=1 }
