@@ -4,8 +4,8 @@
 # SCRIPT METADATA
 #######################################
 SCRIPT_NAME="f5-db-update-active-only.sh"
-SCRIPT_VERSION="1.0"
-SCRIPT_DATE="2026-03-06"
+SCRIPT_VERSION="1.1"
+SCRIPT_DATE="2026-03-25"
 SCRIPT_AUTHOR="ggggg"
 
 #######################################
@@ -32,9 +32,9 @@ TIMESTAMP="$(date +%Y%m%d-%H%M%S)"
 OK="✅"
 ERR="❌"
 INFO="ℹ️"
-WARN="⚠️"
 
 # Commandes demandées
+# Remplace "fasse" par "false" si c'était une coquille
 DB1_NAME="tmm.ssl.useffdhe"
 DB1_VALUE="fasse"
 
@@ -113,32 +113,39 @@ while IFS= read -r LINE <&3 || [[ -n "${LINE:-}" ]]; do
     -o ConnectTimeout="$SSH_TIMEOUT_LONG" \
     -o LogLevel=ERROR \
     "$LOGIN@$F5_HOST" \
-    "DB1_NAME='$DB1_NAME' DB1_VALUE='$DB1_VALUE' DB2_NAME='$DB2_NAME' DB2_VALUE='$DB2_VALUE' bash -s" \
-    >"$LOGFILE" 2>&1 <<'EOF'
-ROLE_RAW="$(tmsh -q -c "show cm failover-status" 2>/dev/null || true)"
+    >"$LOGFILE" 2>&1 <<EOF
+DB1_NAME="$DB1_NAME"
+DB1_VALUE="$DB1_VALUE"
+DB2_NAME="$DB2_NAME"
+DB2_VALUE="$DB2_VALUE"
+
+ROLE_RAW=\$(tmsh -q -c "show cm failover-status" 2>/dev/null || true)
 
 echo "----- Rôle HA -----"
-echo "$ROLE_RAW"
+echo "\$ROLE_RAW"
 echo
 
-if echo "$ROLE_RAW" | grep -qi "ACTIVE"; then
+if echo "\$ROLE_RAW" | grep -qi "ACTIVE"; then
   echo "ACTIVE_DETECTED=1"
   echo "----- Application des commandes -----"
-  tmsh modify sys db "$DB1_NAME" value "$DB1_VALUE"
-  tmsh modify sys db "$DB2_NAME" value "$DB2_VALUE"
+
+  tmsh modify sys db "\$DB1_NAME" value "\$DB1_VALUE"
+  tmsh modify sys db "\$DB2_NAME" value "\$DB2_VALUE"
 
   echo
   echo "----- Vérification -----"
-  tmsh list sys db "$DB1_NAME"
-  tmsh list sys db "$DB2_NAME"
+  tmsh list sys db "\$DB1_NAME"
+  tmsh list sys db "\$DB2_NAME"
 
   echo
   echo "RESULT=UPDATED"
   exit 0
-elif echo "$ROLE_RAW" | grep -qi "STANDBY"; then
+
+elif echo "\$ROLE_RAW" | grep -qi "STANDBY"; then
   echo "ACTIVE_DETECTED=0"
   echo "RESULT=SKIPPED_STANDBY"
   exit 10
+
 else
   echo "ACTIVE_DETECTED=UNKNOWN"
   echo "RESULT=UNKNOWN_ROLE"
